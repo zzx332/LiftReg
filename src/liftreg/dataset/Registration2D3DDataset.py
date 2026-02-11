@@ -137,7 +137,8 @@ class Registration2D3DDataset(Dataset):
         """
         manager = Manager()
         img_label_dic = manager.dict()
-        num_of_workers = 12
+        # num_of_workers = 12
+        num_of_workers = 1
         num_of_workers = num_of_workers if len(self.name_list)>num_of_workers else len(self.name_list)
         split_dict = self.__split_dict(self.name_list, num_of_workers)
         procs = []

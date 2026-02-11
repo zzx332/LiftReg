@@ -1,8 +1,8 @@
 {
     "dataset": {
-        "apply_hu_clip": true,
-        "data_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg/data",
-        "dataset_class": "liftreg.dataset.Registration2D3DDataset.Registration2D3DDataset",
+        "apply_hu_clip": false,
+        "data_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg/data/val",
+        "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
         "img_after_resize": [
             160,
@@ -35,8 +35,8 @@
                 false
             ],
             "workers": [
-                4,
-                4,
+                1,
+                1,
                 0,
                 0
             ]
@@ -50,14 +50,15 @@
             "reg_factor_decay_from": 2,
             "sim_class": "liftreg.layers.losses.NCCLoss"
         },
-        "loss_class": "liftreg.losses.SubspaceLoss.loss",
-        "mode": "test",
+        "loss_class": "liftreg.losses.Subspace2DLoss.loss",
+        "mode": "train",
         "model": {
-            "drr_feature_num": 4,
+            "drr_feature_num": 1,
             "latent_dim": 56,
-            "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca"
+            "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca",
+            "use_pca": false
         },
-        "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj.model",
+        "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model",
         "network_class": "liftreg.networks.RegistrationNet.RegistrationNet",
         "optim": {
             "adam": {
@@ -84,7 +85,7 @@
             },
             "optim_type": "adam"
         },
-        "output_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg",
+        "output_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg_unet",
         "save_3d_img": false,
         "save_extra_3d_img": false,
         "save_fig": true,

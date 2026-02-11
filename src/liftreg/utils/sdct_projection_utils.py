@@ -232,7 +232,6 @@ def backproj_grids_with_poses(poses, img_shape, proj_shape, device=torch.device(
     y = torch.linspace(w-1, 0, w, device=device)
     z = torch.linspace(-h/2, h/2-1, h, device=device)
     grid_x, grid_y, grid_z = torch.meshgrid(x, y, z)
-
     
 
     poses = torch.from_numpy(poses).to(device).unsqueeze(3).unsqueeze(3).unsqueeze(3)
@@ -248,6 +247,78 @@ def backproj_grids_with_poses(poses, img_shape, proj_shape, device=torch.device(
     grids[:, :, 1] = grids[:, :, 1]/proj_h*2.0
     
     return grids.flip(2)
+    
+def make_centered_volume_xyz(D, H, W, device, spacing=(1.,1.,1.), origin=(0.,0.,0.)):
+    """
+    返回 xyz: (D,H,W,3)，世界坐标（volume坐标）
+    spacing: (sx,sy,sz) 分别对应 x(W), y(H), z(D) 的物理间距
+    origin: 体数据中心在世界坐标的位置（可自定义）
+    """
+    sx, sy, sz = spacing
+    ox, oy, oz = origin
+
+    x = (torch.arange(W, device=device) - (W-1)/2) * sx + ox
+    y = (torch.arange(H, device=device) - (H-1)/2) * sy + oy
+    z = (torch.arange(D, device=device) - (D-1)/2) * sz + oz
+
+    zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")  # (D,H,W)
+    xyz = torch.stack([xx, yy, zz], dim=-1)              # (D,H,W,3)
+    return xyz
+
+def backproj_grids_with_SOUV(
+    img_shape,               # (D,H,W,3) 体素点世界坐标
+    S, O, U, V,        # (B,P,3)
+    proj_w, proj_h,
+    du, dv,            # 标量 或 (B,P) / (B,P,1)
+    cu=None, cv=None,  # 主点像素坐标
+    eps=1e-6,
+    device=torch.device("cpu")):
+    B, P, _ = S.shape
+    D, H, W = img_shape
+    xyz = make_centered_volume_xyz(D, H, W, device, spacing=(2.2, 2.2, 2.2))
+    if cu is None: cu = (proj_w - 1) / 2.0
+    if cv is None: cv = (proj_h - 1) / 2.0
+
+    # 统一形状
+    S = S.to(device).view(B, P, 3, 1, 1, 1)
+    O = O.to(device).view(B, P, 3, 1, 1, 1)
+    U = U.to(device).view(B, P, 3, 1, 1, 1)
+    V = V.to(device).view(B, P, 3, 1, 1, 1)
+
+    # xyz -> (1,1,3,D,H,W)
+    X = xyz.permute(3,0,1,2).unsqueeze(0).unsqueeze(0)  # (1,1,3,D,H,W)
+
+    # 平面法向
+    N = torch.cross(U, V, dim=2)  # (B,P,3,1,1,1)
+
+    XS = X - S                     # (B,P,3,D,H,W) via broadcast
+    OS = O - S                     # (B,P,3,1,1,1)
+
+    denom = (N * XS).sum(dim=2, keepdim=True)           # (B,P,1,D,H,W)
+    numer = (N * OS).sum(dim=2, keepdim=True)           # (B,P,1,1,1,1)
+
+    t = numer / (denom + eps)                           # (B,P,1,D,H,W)
+    Pnt = S + t * XS                                    # (B,P,3,D,H,W)
+
+    PO = Pnt - O                                        # (B,P,3,D,H,W)
+    alpha = (PO * U).sum(dim=2)                         # (B,P,D,H,W)
+    beta  = (PO * V).sum(dim=2)                         # (B,P,D,H,W)
+
+    # 像素间距
+    if not torch.is_tensor(du): du = torch.tensor(du, device=device)
+    if not torch.is_tensor(dv): dv = torch.tensor(dv, device=device)
+    du = du.to(device).view(-1, P, 1, 1, 1) if du.ndim >= 2 else du.view(1,1,1,1,1)
+    dv = dv.to(device).view(-1, P, 1, 1, 1) if dv.ndim >= 2 else dv.view(1,1,1,1,1)
+
+    u = alpha / (du + eps) + cu
+    v = beta  / (dv + eps) + cv
+
+    # grid_sample 归一化
+    u_norm = 2.0 * (u / (proj_w - 1)) - 1.0
+    v_norm = 2.0 * (v / (proj_h - 1)) - 1.0
+
+    grid = torch.stack([u_norm, v_norm], dim=-1)        # (B,P,D,H,W,2)
+    return grid
 
 def forward_grids_with_poses(poses, spacing, img_shape, device=torch.device("cpu"), receptor_size=None):
     sample_rate = [int(1), int(1), int(1)]
