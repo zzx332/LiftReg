@@ -1,6 +1,6 @@
 {
     "dataset": {
-        "apply_hu_clip": false,
+        "apply_hu_clip": true,
         "data_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg/data/val",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",

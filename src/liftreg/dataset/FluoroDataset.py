@@ -112,7 +112,8 @@ class FluoroDataset(Dataset):
             resampler.SetDefaultPixelValue(0)
         else:
             resampler.SetInterpolator(sitk.sitkLinear)
-            resampler.SetDefaultPixelValue(-1000)
+            # resampler.SetDefaultPixelValue(-1000)
+            resampler.SetDefaultPixelValue(-2048)
         # 2) 计算输入图像中心（物理坐标）
         dir_in = np.array(image.GetDirection()).reshape(3,3)
         org_in = np.array(image.GetOrigin(), dtype=float)
@@ -145,7 +146,7 @@ class FluoroDataset(Dataset):
             # source_img = np.flip(source_img, axis=(1))
             source_arr = source_arr.astype(np.float32)
             if self.apply_hu_clip:
-                source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-100, 0])
+                source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-1000, 1000])
             else:
                 source_arr = self._normalize_intensity(source_arr, linear_clip=True)
             if self.has_label:
@@ -196,7 +197,7 @@ class FluoroDataset(Dataset):
             if resample_target is not None:
                 transform = torchio.transforms.Compose([
                     torchio.transforms.Resample((2.2, 2.2, 2.2)),
-                    torchio.transforms.CropOrPad((160, 160, 160)),
+                    torchio.transforms.CropOrPad((160, 160, 160), padding_mode=-2048),
                 ])
 
                 source_img = transform(source_img)
@@ -206,7 +207,7 @@ class FluoroDataset(Dataset):
             # source_img = np.flip(source_img, axis=(1))
             # source_arr = source_arr.astype(np.float32)
             if self.apply_hu_clip:
-                source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-100, 0])
+                source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-1000, 1000])
             else:
                 source_arr = self._normalize_intensity(source_arr, linear_clip=True)
             if self.has_label:
