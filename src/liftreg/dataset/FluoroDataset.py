@@ -53,6 +53,7 @@ class FluoroDataset(Dataset):
         self.spacing_list = []
         self.target_poses_list = []
         self.target_poses_SOUV_list = []
+        self.affine_list = []
         self.init_img_pool()
 
     def get_identifier_list(self):
@@ -227,6 +228,7 @@ class FluoroDataset(Dataset):
             target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
             target_proj = sitk.GetArrayFromImage(target_proj)
             target_proj = target_proj.astype(np.float32)
+            target_proj = np.transpose(target_proj, [0, 2, 1])
             target_proj = self._normalize_intensity(target_proj)[::self.load_projection_interval]
                 # Frame-of-reference change
             if orientation == "AP":
@@ -270,6 +272,7 @@ class FluoroDataset(Dataset):
             img_label_np['target_poses_SOUV'] = self._extrinsic_cam2world_to_SOUV(img_label_np['target_poses'], reorient, sdd=1020.0)
             # img_label_np['target_poses'] = RigidTransform(img_label_np['target_poses'])
             img_label_np["spacing"] = np.array(self.spacing)
+            img_label_np["affine"] = torch.as_tensor(source_img.affine, dtype=torch.float32)
             
             img_label_dic[identifier] = img_label_np
             count += 1
@@ -334,7 +337,7 @@ class FluoroDataset(Dataset):
             self.spacing_list.append(case['spacing'])
             self.target_poses_list.append(case["target_poses"])
             self.target_poses_SOUV_list.append(case["target_poses_SOUV"])
-
+            self.affine_list.append(case["affine"])
         
         print("the loading phase {} finished, total {} img and labels have been loaded".format(self.phase, len(img_label_dic)))
 
@@ -482,6 +485,7 @@ class FluoroDataset(Dataset):
         sample['target_poses'] = self.target_poses_list[idx]
         sample['target_poses_SOUV'] = self.target_poses_SOUV_list[idx]
         sample['spacing'] = self.spacing_list[idx].copy()
+        sample['affine'] = self.affine_list[idx]
         return sample, filename
 
 

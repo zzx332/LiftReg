@@ -182,6 +182,7 @@ class model(nn.Module):
         target_poses = RigidTransform(input['target_poses']).cuda()
         target_poses_SOUV = input['target_poses_SOUV']
         density = input['density']
+        affine_inverse = input['affine'].inverse().cuda()
         reorient = torch.tensor(
             [
                 [1, 0, 0, 0],
@@ -205,18 +206,30 @@ class model(nn.Module):
         ).cuda() 
         source, target = detector(target_poses, calibration=None)
         kwargs = {}
-        img = (target - source).norm(dim=-1).unsqueeze(1)
-        img = self.renderer(density[0, 0], source, target, img, **kwargs).view(B,
-                    -1,
-                    detector.height,
-                    detector.width)
+        # Initialize the image with the length of each cast ray
+        img_input = (target - source).norm(dim=-1).unsqueeze(1)
+
+        # Convert rays to voxelspace
+        source = RigidTransform(affine_inverse)(source)
+        target = RigidTransform(affine_inverse)(target)
+        # org_proj = self.renderer(density[0, 0], source, target, img_input, **kwargs).view(B,
+        #             -1,
+        #             detector.height,
+        #             detector.width)
         # 估计形变场
         coefs, disp_field = self._estimate_flow(moving, target_proj, target_poses_SOUV)
         
         # 应用形变
         deform_field = disp_field + self.id_transform
         warped_source = self.bilinear(moving_cp, deform_field)
-        
+        warped_moving = self.bilinear(moving, deform_field)
+        warped_moving = self.inverse_normalization(warped_moving)
+        warped_moving = self.transform_hu_to_density(warped_moving, bone_attenuation_multiplier=2.0)
+        warped_proj = self.renderer(warped_moving[0, 0], source, target, img_input, **kwargs).view(B,
+            -1,
+            detector.height,
+            detector.width)
+
         model_output = {
             "warped": warped_source,
             "phi": deform_field,
@@ -227,7 +240,27 @@ class model(nn.Module):
             "warped_proj": target_proj
         }
         return model_output
-    
+
+    def inverse_normalization(self, img, clip_range=[-1000, 1000]):
+        img = (img + 1) / 2
+        img = img * (clip_range[1] - clip_range[0]) + clip_range[0]
+        return img
+
+    def transform_hu_to_density(self, volume, bone_attenuation_multiplier):
+        # volume can be loaded as int16, need to convert to float32 to use float bone_attenuation_multiplier
+        volume = volume.to(torch.float32)
+        air = torch.where(volume <= -800)
+        soft_tissue = torch.where((-800 < volume) & (volume <= 350))
+        bone = torch.where(350 < volume)
+
+        density = torch.empty_like(volume)
+        density[air] = volume[soft_tissue].min()
+        density[soft_tissue] = volume[soft_tissue]
+        density[bone] = volume[bone] * bone_attenuation_multiplier
+        density -= density.min()
+        density /= density.max()
+        return density
+
     def _estimate_flow(self, moving, target_proj, poses):
         """使用 ResUNet 估计形变场"""
         batch_size, proj_num, proj_w, proj_h = target_proj.shape
