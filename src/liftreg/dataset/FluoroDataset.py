@@ -52,6 +52,7 @@ class FluoroDataset(Dataset):
         self.proj_list = []
         self.spacing_list = []
         self.target_poses_list = []
+        self.target_poses_SOUV_list = []
         self.init_img_pool()
 
     def get_identifier_list(self):
@@ -80,6 +81,7 @@ class FluoroDataset(Dataset):
         density -= density.min()
         density /= density.max()
         return density
+
     def _resample_image(self, image, new_size, new_spacing, is_label=False):
         """
         重采样图像到指定大小和间距
@@ -203,6 +205,10 @@ class FluoroDataset(Dataset):
                 source_img = transform(source_img)
                 source_seg = transform(source_seg)
             source_arr = source_img.data.detach().cpu().numpy().astype(np.float32).squeeze(0)
+            # Convert the volume to density
+            density = self.transform_hu_to_density(source_img.data, bone_attenuation_multiplier = 2.0)
+            density = ScalarImage(tensor=density, affine=source_img.affine)
+            density_arr = density.data.detach().cpu().numpy().astype(np.float32).squeeze(0)
             # not sure if this is correct
             # source_img = np.flip(source_img, axis=(1))
             # source_arr = source_arr.astype(np.float32)
@@ -216,6 +222,7 @@ class FluoroDataset(Dataset):
             else:
                 img_label_np['source_seg'] = None
             img_label_np['source'] = blosc.pack_array(source_arr)
+            img_label_np['density'] = blosc.pack_array(density_arr)
 
             target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
             target_proj = sitk.GetArrayFromImage(target_proj)
@@ -260,9 +267,9 @@ class FluoroDataset(Dataset):
             img_label_np['target_proj'] = blosc.pack_array(target_proj)
             # Load geo info
             img_label_np['target_poses'] , *_ = torch.load(os.path.join(self.drr_path,  identifier.split("_")[0] + "_pose.pt"), weights_only=False)["pose"][::self.load_projection_interval]
-            img_label_np['target_poses'] = self._extrinsic_cam2world_to_SOUV(img_label_np['target_poses'], reorient, sdd=1020.0)
+            img_label_np['target_poses_SOUV'] = self._extrinsic_cam2world_to_SOUV(img_label_np['target_poses'], reorient, sdd=1020.0)
+            # img_label_np['target_poses'] = RigidTransform(img_label_np['target_poses'])
             img_label_np["spacing"] = np.array(self.spacing)
-            # img_label_np['reorient'] = reorient
             
             img_label_dic[identifier] = img_label_np
             count += 1
@@ -317,15 +324,17 @@ class FluoroDataset(Dataset):
             case = img_label_dic[case_name]
             if self.has_label:
                 # self.pair_list.append([case['source'], case['target'], case['source_seg'], case['target_seg']])
-                self.pair_list.append([case['source'], case['source_seg']])
+                self.pair_list.append([case['source'], case['source_seg'], case['density']])
             else:
                 # self.pair_list.append([case['source'], case['target']])
-                self.pair_list.append([case['source']])
+                self.pair_list.append([case['source'], case['density']])
             # self.proj_list.append([case['target_proj'], case['source_proj']])
             self.proj_list.append([case['target_proj']])
 
             self.spacing_list.append(case['spacing'])
             self.target_poses_list.append(case["target_poses"])
+            self.target_poses_SOUV_list.append(case["target_poses_SOUV"])
+
         
         print("the loading phase {} finished, total {} img and labels have been loaded".format(self.phase, len(img_label_dic)))
 
@@ -456,6 +465,9 @@ class FluoroDataset(Dataset):
             # sample["source_label"] = np.expand_dims(pair_list[2], axis=0)
             # sample["target_label"] = np.expand_dims(pair_list[3], axis=0)
             sample["source_label"] = np.expand_dims(pair_list[1], axis=0)
+            sample["density"] = np.expand_dims(pair_list[2], axis=0)
+        else:
+            sample["density"] = np.expand_dims(pair_list[1], axis=0)
         sample["target_proj"] = np.asarray(proj_list[0]).astype(np.float32)
         # sample["source_proj"] = np.asarray(proj_list[1]).astype(np.float32)
 
@@ -468,6 +480,7 @@ class FluoroDataset(Dataset):
             sample['target_proj'] = self.transform(sample['target_proj'])
             # sample['source_proj'] = self.transform(sample['source_proj'])
         sample['target_poses'] = self.target_poses_list[idx]
+        sample['target_poses_SOUV'] = self.target_poses_SOUV_list[idx]
         sample['spacing'] = self.spacing_list[idx].copy()
         return sample, filename
 

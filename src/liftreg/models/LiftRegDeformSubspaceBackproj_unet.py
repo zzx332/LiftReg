@@ -1,3 +1,4 @@
+import SimpleITK as sitk
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -7,6 +8,7 @@ import numpy as np
 from ..utils.sdct_projection_utils import backproj_grids_with_poses, backproj_grids_with_SOUV
 from diffdrr.detector import Detector
 from diffdrr.renderers import Siddon, Trilinear
+from diffdrr.pose import RigidTransform
 
 class ResidualBlock(nn.Module):
     """残差块"""
@@ -159,19 +161,8 @@ class model(nn.Module):
         
         self.id_transform = gen_identity_map(self.img_sz, 1.0)
         self.backward_proj_grids = None
-        self.detector = Detector(
-            1020.0,
-            718,
-            718,
-            0.388,
-            0.388,
-            0,
-            0,
-            torch.eye(3),
-            reverse_x_axis=False,
-            n_subsample=None,
-        )
-        # self.renderer = Siddon(voxel_shift, **renderer_kwargs)
+        renderer_kwargs = {}
+        self.renderer = Siddon(voxel_shift=0.0, **renderer_kwargs)
     def forward(self, input):
         # Parse input
         moving = input['source']
@@ -188,11 +179,39 @@ class model(nn.Module):
             # target_cp = target
         
         B, _, D, W, H = moving.shape
-        target_poses = input['target_poses']
-        # source, target = self.detector(target_poses, calibration)
-        # img = self.render(self.density, source, target, mask_to_channels, **kwargs)
+        target_poses = RigidTransform(input['target_poses']).cuda()
+        target_poses_SOUV = input['target_poses_SOUV']
+        density = input['density']
+        reorient = torch.tensor(
+            [
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.float32,
+        )
+        detector = Detector(
+            1020.0,
+            718,
+            718,
+            0.388,
+            0.388,
+            0,
+            0,
+            reorient,
+            reverse_x_axis=True,
+            n_subsample=None,
+        ).cuda() 
+        source, target = detector(target_poses, calibration=None)
+        kwargs = {}
+        img = (target - source).norm(dim=-1).unsqueeze(1)
+        img = self.renderer(density[0, 0], source, target, img, **kwargs).view(B,
+                    -1,
+                    detector.height,
+                    detector.width)
         # 估计形变场
-        coefs, disp_field = self._estimate_flow(moving, target_proj, target_poses)
+        coefs, disp_field = self._estimate_flow(moving, target_proj, target_poses_SOUV)
         
         # 应用形变
         deform_field = disp_field + self.id_transform
