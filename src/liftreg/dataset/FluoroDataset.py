@@ -133,52 +133,52 @@ class FluoroDataset(Dataset):
        
         return resampler.Execute(image)
 
-    def _read_case(self, identifier_list, img_label_dic):
-        pbar = pb.ProgressBar(widgets=[pb.Percentage(), pb.Bar(), pb.ETA()], maxval=len(identifier_list)).start()
-        count = 0
-        for identifier in identifier_list:
-            img_label_np = {}
-            # Pay attention here. Flip is used to transform SAR orientation to SPR orientation.
-            # This is only applied to synthetic dataset because the real data has already been transformed in preprocessing script.
-            # TODO: Should make such change in preprocess script.
-            # source_img = np.flip(np.load(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz")).astype(np.float32), axis=(1))
-            source_img = sitk.ReadImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz"))
-            source_img = self._resample_image(source_img, [160, 160, 160], [2.2, 2.2, 2.2], is_label=False)
-            source_arr = sitk.GetArrayFromImage(source_img)
-            # not sure if this is correct
-            # source_img = np.flip(source_img, axis=(1))
-            source_arr = source_arr.astype(np.float32)
-            if self.apply_hu_clip:
-                source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-1000, 1000])
-            else:
-                source_arr = self._normalize_intensity(source_arr, linear_clip=True)
-            if self.has_label:
-                source_seg = sitk.ReadImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source_seg.nii.gz"))
-                source_seg = self._resample_image(source_seg, [160, 160, 160], [2.2, 2.2, 2.2], is_label=True)
-                source_seg = sitk.GetArrayFromImage(source_seg)                
-                # not sure if this is correct
-                # source_seg = np.flip(source_seg, axis=(1))
-                source_seg = source_seg.astype(np.float32)
-                img_label_np['source_seg'] = blosc.pack_array(source_seg)
-            else:
-                img_label_np['source_seg'] = None
-            img_label_np['source'] = blosc.pack_array(source_arr)
+    # def _read_case(self, identifier_list, img_label_dic):
+    #     pbar = pb.ProgressBar(widgets=[pb.Percentage(), pb.Bar(), pb.ETA()], maxval=len(identifier_list)).start()
+    #     count = 0
+    #     for identifier in identifier_list:
+    #         img_label_np = {}
+    #         # Pay attention here. Flip is used to transform SAR orientation to SPR orientation.
+    #         # This is only applied to synthetic dataset because the real data has already been transformed in preprocessing script.
+    #         # TODO: Should make such change in preprocess script.
+    #         # source_img = np.flip(np.load(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz")).astype(np.float32), axis=(1))
+    #         source_img = sitk.ReadImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz"))
+    #         source_img = self._resample_image(source_img, [160, 160, 160], [2.2, 2.2, 2.2], is_label=False)
+    #         source_arr = sitk.GetArrayFromImage(source_img)
+    #         # not sure if this is correct
+    #         # source_img = np.flip(source_img, axis=(1))
+    #         source_arr = source_arr.astype(np.float32)
+    #         if self.apply_hu_clip:
+    #             source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-1000, 1000])
+    #         else:
+    #             source_arr = self._normalize_intensity(source_arr, linear_clip=True)
+    #         if self.has_label:
+    #             source_seg = sitk.ReadImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source_seg.nii.gz"))
+    #             source_seg = self._resample_image(source_seg, [160, 160, 160], [2.2, 2.2, 2.2], is_label=True)
+    #             source_seg = sitk.GetArrayFromImage(source_seg)                
+    #             # not sure if this is correct
+    #             # source_seg = np.flip(source_seg, axis=(1))
+    #             source_seg = source_seg.astype(np.float32)
+    #             img_label_np['source_seg'] = blosc.pack_array(source_seg)
+    #         else:
+    #             img_label_np['source_seg'] = None
+    #         img_label_np['source'] = blosc.pack_array(source_arr)
 
-            target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
-            target_proj = sitk.GetArrayFromImage(target_proj)
-            target_proj = target_proj.astype(np.float32)
-            target_proj = self._normalize_intensity(target_proj, linear_clip=True, clip_range=(0,6))[::self.load_projection_interval]
-            img_label_np['target_proj'] = blosc.pack_array(target_proj)
+    #         target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
+    #         target_proj = sitk.GetArrayFromImage(target_proj)
+    #         target_proj = target_proj.astype(np.float32)
+    #         target_proj = self._normalize_intensity(target_proj, linear_clip=True, clip_range=(0,6))[::self.load_projection_interval]
+    #         img_label_np['target_proj'] = blosc.pack_array(target_proj)
 
-            # Load geo info
-            img_label_np['target_poses'] , *_ = torch.load(os.path.join(self.drr_path,  identifier.split("_")[0] + "_pose.pt"), weights_only=False)["pose"][::self.load_projection_interval]
-            img_label_np['target_poses'] = self._convert_extrinsic_to_pose(img_label_np['target_poses'], source_img)
-            img_label_np["spacing"] = np.array(self.spacing)
+    #         # Load geo info
+    #         img_label_np['target_poses'] , *_ = torch.load(os.path.join(self.drr_path,  identifier.split("_")[0] + "_pose.pt"), weights_only=False)["pose"][::self.load_projection_interval]
+    #         img_label_np['target_poses'] = self._convert_extrinsic_to_pose(img_label_np['target_poses'], source_img)
+    #         img_label_np["spacing"] = np.array(self.spacing)
             
-            img_label_dic[identifier] = img_label_np
-            count += 1
-            pbar.update(count)
-        pbar.finish()
+    #         img_label_dic[identifier] = img_label_np
+    #         count += 1
+    #         pbar.update(count)
+    #     pbar.finish()
 
     def _read_case_polypose(self, identifier_list, img_label_dic, center_volume=True, resample_target=[160, 160, 160], orientation="PA"):
         pbar = pb.ProgressBar(widgets=[pb.Percentage(), pb.Bar(), pb.ETA()], maxval=len(identifier_list)).start()
@@ -420,7 +420,7 @@ class FluoroDataset(Dataset):
             min_intensity = img.min()
             max_intensity = img.max()
             normalized_img = (img-img.min())/(max_intensity - min_intensity)
-        normalized_img = normalized_img*2 - 1
+        normalized_img = normalized_img * 2 - 1
         return normalized_img
 
     def __read_and_clean_itk_info(self,path):

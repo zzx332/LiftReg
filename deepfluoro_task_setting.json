@@ -45,8 +45,8 @@
         "epoch": 300,
         "gpu_ids": 0,
         "loss": {
-            "initial_reg_factor": 0.01,
-            "min_reg_factor": 0.01,
+            "initial_reg_factor": 0.001,
+            "min_reg_factor": 0.001,
             "reg_factor_decay_from": 2,
             "sim_class": "liftreg.layers.losses.NCCLoss"
         },

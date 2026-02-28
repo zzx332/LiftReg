@@ -113,7 +113,7 @@ class Registration2D3DDataset(Dataset):
             img_label_np['target_proj'] = blosc.pack_array(target_proj.astype(np.float32))
 
             # Load roi
-            if self.roi_path is not "":
+            if self.roi_path != "":
                 roi = np.load(os.path.join(self.roi_path, f"{case_id}_target_proj_roi.npy"))[::self.load_projection_interval]
                 img_label_np["target_proj_roi"] = blosc.pack_array(roi.astype(np.int))
 

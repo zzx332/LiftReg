@@ -150,6 +150,7 @@ def resume_train(model_path, model, optimizer, lr_scheduler=None):
         
         try:
             model.load_state_dict(checkpoint['state_dict'])
+            # model.load_state_dict(checkpoint['model_state_dict'])
             print("=> succeed load model '{}'".format(model_path))
         except:
             ############### TODO  Currently not compatabile to enemble network ###############

@@ -247,7 +247,7 @@ def backproj_grids_with_poses(poses, img_shape, proj_shape, device=torch.device(
     grids[:, :, 1] = grids[:, :, 1]/proj_h*2.0
     
     return grids.flip(2)
-    
+
 def make_centered_volume_xyz(D, H, W, device, spacing=(1.,1.,1.), origin=(0.,0.,0.)):
     """
     返回 xyz: (D,H,W,3)，世界坐标（volume坐标）

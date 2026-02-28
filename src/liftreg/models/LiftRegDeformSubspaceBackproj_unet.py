@@ -160,7 +160,7 @@ class model(nn.Module):
             )
         
         self.id_transform = gen_identity_map(self.img_sz, 1.0)
-        self.backward_proj_grids = None
+        # self.backward_proj_grids = None
         renderer_kwargs = {}
         self.renderer = Siddon(voxel_shift=0.0, **renderer_kwargs)
     def forward(self, input):
@@ -220,7 +220,11 @@ class model(nn.Module):
         coefs, disp_field = self._estimate_flow(moving, target_proj, target_poses_SOUV)
         
         # 应用形变
-        deform_field = disp_field + self.id_transform
+        disp_norm = disp_field.clone()
+        disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))  # x
+        disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))  # y
+        disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))  # z
+        deform_field = disp_norm + self.id_transform
         warped_source = self.bilinear(moving_cp, deform_field)
         warped_moving = self.bilinear(moving, deform_field)
         warped_moving = self.inverse_normalization(warped_moving)
@@ -232,18 +236,19 @@ class model(nn.Module):
 
         model_output = {
             "warped": warped_source,
+            "warped_moving": warped_moving,
             "phi": deform_field,
             "params": disp_field,
             # "target": target_cp,
             "pca_coefs": coefs,
             "target_proj": target_proj,
-            "warped_proj": target_proj
+            "warped_proj": warped_proj
         }
         return model_output
 
     def inverse_normalization(self, img, clip_range=[-1000, 1000]):
         img = (img + 1) / 2
-        img = img * (clip_range[1] - clip_range[0]) + clip_range[0]
+        img = (img * (clip_range[1] - clip_range[0])) + clip_range[0]
         return img
 
     def transform_hu_to_density(self, volume, bone_attenuation_multiplier):
@@ -257,64 +262,70 @@ class model(nn.Module):
         density[air] = volume[soft_tissue].min()
         density[soft_tissue] = volume[soft_tissue]
         density[bone] = volume[bone] * bone_attenuation_multiplier
-        density -= density.min()
-        density /= density.max()
+
+        # 关键：避免 in-place 算术，改成 out-of-place
+        density_min = density.min()
+        density = density - density_min
+        density_max = density.max()
+        density = density / density_max
+
         return density
 
     def _estimate_flow(self, moving, target_proj, poses):
         """使用 ResUNet 估计形变场"""
-        batch_size, proj_num, proj_w, proj_h = target_proj.shape
-        w, d, h = moving.shape[2:]
-        B, _, D, W, H = moving.shape
+        batch_size, proj_num, proj_h, proj_w = target_proj.shape
+        d, h, w = moving.shape[2:]
+        B, _, D, H, W = moving.shape
         S, O, U, V = poses
         
         # 反向投影
-        if self.backward_proj_grids is None:
-            with torch.no_grad():
-                self.backward_proj_grids = backproj_grids_with_SOUV(
-                    moving.shape[2:], 
-                    S, O, U, V,
-                    proj_w, proj_h,
-                    du=0.388, dv=0.388,
-                    cu=(proj_w - 1) / 2.0, cv=(proj_h - 1) / 2.0,
-                    device=moving.device
-                )
+        with torch.no_grad():
+            backward_proj_grids = backproj_grids_with_SOUV(
+                moving.shape[2:], 
+                S, O, U, V,
+                proj_w, proj_h,
+                du=0.388, dv=0.388,
+                cu=(proj_w - 1) / 2.0,
+                cv=(proj_h - 1) / 2.0,
+                device=moving.device
+            )
 
-        # target_volume = F.grid_sample(
-        #     target_proj.reshape(batch_size*proj_num, 1, proj_w, proj_h), 
-        #     self.backward_proj_grids.reshape(
-        #         batch_size*proj_num, w*d, h, -1
-        #     ),
-        #     align_corners=True,
-        #     padding_mode="zeros"
-        # ).reshape(batch_size, proj_num, w, d, h).detach()
-        
-        # 1) 先把 grid reshape 出来（明确最后一维=2）
-        grid = self.backward_proj_grids.reshape(
-            batch_size * proj_num, w * d, h, 2
-        )
+            # target_volume = F.grid_sample(
+            #     target_proj.reshape(batch_size*proj_num, 1, proj_w, proj_h), 
+            #     self.backward_proj_grids.reshape(
+            #         batch_size*proj_num, w*d, h, -1
+            #     ),
+            #     align_corners=True,
+            #     padding_mode="zeros"
+            # ).reshape(batch_size, proj_num, w, d, h).detach()
+            
+            # 1) 先把 grid reshape 出来（明确最后一维=2）
+            grid = backward_proj_grids.reshape(
+                batch_size * proj_num, d * h, w, 2
+            )
 
-        # 2) 正常 grid_sample（padding_mode 仍然用 zeros）
-        target_volume_flat = F.grid_sample(
-            target_proj.reshape(batch_size * proj_num, 1, proj_w, proj_h),
-            grid,
-            align_corners=True,
-            padding_mode="zeros"
-        )  # -> (B*P, 1, w*d, h)
+            # 2) 正常 grid_sample（padding_mode 仍然用 zeros）
+            target_volume_flat = F.grid_sample(
+                target_proj.reshape(batch_size * proj_num, 1, proj_h, proj_w),
+                grid,
+                align_corners=True,
+                padding_mode="zeros"
+                # padding_mode="border"
+            )  # -> (B*P, 1, h*d, w)
 
-        # 3) 计算越界 mask：grid 超出 [-1, 1] 就是 padding 区域
-        invalid = (
-            (grid[..., 0] < -1.0) | (grid[..., 0] > 1.0) |
-            (grid[..., 1] < -1.0) | (grid[..., 1] > 1.0)
-        )  # (B*P, w*d, h)
+            # 3) 计算越界 mask：grid 超出 [-1, 1] 就是 padding 区域
+            invalid = (
+                (grid[..., 0] < -1.0) | (grid[..., 0] > 1.0) |
+                (grid[..., 1] < -1.0) | (grid[..., 1] > 1.0)
+            )  # (B*P, w*d, h)
 
-        # 4) 扩到和输出同形状 (B*P, 1, w*d, h)，并把 padding 区域改成 -1
-        target_volume_flat[invalid.unsqueeze(1)] = -1.0
+            # 4) 扩到和输出同形状 (B*P, 1, w*d, h)，并把 padding 区域改成 -1
+            target_volume_flat[invalid.unsqueeze(1)] = -1.0
 
-        # 5) reshape 回你要的形状
-        target_volume = target_volume_flat.reshape(
-            batch_size, proj_num, w, d, h
-        ).detach()
+            # 5) reshape 回你要的形状
+            target_volume = target_volume_flat.reshape(
+                batch_size, proj_num, d, h, w
+            )
         # 拼接输入
         x = torch.cat([moving, target_volume], dim=1)
         
@@ -343,7 +354,7 @@ class model(nn.Module):
             features = self.global_pool(x)
             coefs = self.fc_layers(features)
             disp_field = F.linear(coefs, self.pca_vectors, self.pca_mean).reshape(
-                B, 3, D, W, H
+                B, 3, D, H, W
             )
         else:
             # 直接输出 displacement field

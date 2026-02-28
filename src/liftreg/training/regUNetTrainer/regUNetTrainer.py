@@ -153,6 +153,7 @@ class regUNetTrainer:
         # Init model.
         self.model = get_class(train_setting['model_class'])(self.input_img_sz, setting["train"]["model"])
         self.model = self.model.to(self.device)
+        self.lr_scheduler = None
         # Init loss.
         self.loss = get_class(train_setting['loss_class'])(setting["train"]["loss"])
         
@@ -260,7 +261,7 @@ class regUNetTrainer:
         self.optimizer.step()
         
         # 返回损失值
-        loss_dict = {k: v.item() if isinstance(v, torch.Tensor) else v 
+        loss_dict = {k: v.detach().item() if isinstance(v, torch.Tensor) else v 
                      for k, v in losses.items()}
         
         return loss_dict
@@ -274,7 +275,7 @@ class regUNetTrainer:
             output["epoch"] = self.cur_epoch
             losses = self.loss(output)
         
-        loss_dict = {k: v.item() if isinstance(v, torch.Tensor) else v 
+        loss_dict = {k: v.detach().item() if isinstance(v, torch.Tensor) else v 
                      for k, v in losses.items()}
         
         return loss_dict, output
@@ -291,10 +292,10 @@ class regUNetTrainer:
             print(f"\nEpoch [{epoch+1}/{self.epochs}]")
             epoch_losses = []
             
-            for data in self.dataloaders['train']:
+            for batch in self.dataloaders['train']:
                 
                 # 训练步骤
-                loss_dict = self.train_step(self.set_input(data))
+                loss_dict = self.train_step(self.set_input(batch))
                 epoch_losses.append(loss_dict['total_loss'])
                 for k,v in loss_dict.items():
                     self.writer.add_scalar(f"Train/{k}", v, epoch)        
@@ -306,7 +307,7 @@ class regUNetTrainer:
             # 验证阶段
             if (epoch + 1) % self.val_frequency == 0:
                 print("  执行验证...")
-                val_loss_dict, output = self.val_step(self.set_input(data))
+                val_loss_dict, output = self.val_step(self.set_input(batch))
                 print(f"  验证损失: {val_loss_dict['total_loss']:.4f}")
                 
                 # 打印输出的形状信息
@@ -321,7 +322,7 @@ class regUNetTrainer:
             print(f"  当前学习率: {current_lr:.6f}")
             
             # 保存检查点
-            if (epoch + 1) % 5 == 0:
+            if (epoch + 1) % 50 == 0:
                 self.save_checkpoint(epoch)
         
         print("\n训练完成！")
