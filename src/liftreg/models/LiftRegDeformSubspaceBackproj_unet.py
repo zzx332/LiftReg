@@ -5,7 +5,6 @@ import torch.nn.functional as F
 from ..layers.layers import convBlock, FullyConnectBlock, GaussianSmoothing
 from ..utils.net_utils import Bilinear, gen_identity_map
 import numpy as np
-from ..utils.sdct_projection_utils import backproj_grids_with_poses, backproj_grids_with_SOUV
 from diffdrr.detector import Detector
 from diffdrr.renderers import Siddon, Trilinear
 from diffdrr.pose import RigidTransform
@@ -168,6 +167,7 @@ class model(nn.Module):
         moving = input['source']
         # target = input['target']
         target_proj = input["target_proj"]
+        target_volume = input["target_volume"]
         
         if 'source_label' in input:
             moving_seg = input['source_label']
@@ -180,7 +180,6 @@ class model(nn.Module):
         
         B, _, D, W, H = moving.shape
         target_poses = RigidTransform(input['target_poses']).cuda()
-        target_poses_SOUV = input['target_poses_SOUV']
         density = input['density']
         affine_inverse = input['affine'].inverse().cuda()
         reorient = torch.tensor(
@@ -212,12 +211,9 @@ class model(nn.Module):
         # Convert rays to voxelspace
         source = RigidTransform(affine_inverse)(source)
         target = RigidTransform(affine_inverse)(target)
-        # org_proj = self.renderer(density[0, 0], source, target, img_input, **kwargs).view(B,
-        #             -1,
-        #             detector.height,
-        #             detector.width)
+
         # 估计形变场
-        coefs, disp_field = self._estimate_flow(moving, target_proj, target_poses_SOUV)
+        coefs, disp_field = self._estimate_flow(moving, target_volume)
         
         # 应用形变
         disp_norm = disp_field.clone()
@@ -295,62 +291,10 @@ class model(nn.Module):
 
         return density
 
-    def _estimate_flow(self, moving, target_proj, poses):
+    def _estimate_flow(self, moving, target_volume):
         """使用 ResUNet 估计形变场"""
-        batch_size, proj_num, proj_h, proj_w = target_proj.shape
-        d, h, w = moving.shape[2:]
         B, _, D, H, W = moving.shape
-        S, O, U, V = poses
-        target_proj = target_proj.permute(0, 1, 3, 2).flip(dims=[3])
-        # 反向投影
-        with torch.no_grad():
-            backward_proj_grids = backproj_grids_with_SOUV(
-                moving.shape[2:], 
-                S, O, U, V,
-                proj_w, proj_h,
-                du=0.388, dv=0.388,
-                cu=(proj_w - 1) / 2.0,
-                cv=(proj_h - 1) / 2.0,
-                device=moving.device
-            )
 
-            # target_volume = F.grid_sample(
-            #     target_proj.reshape(batch_size*proj_num, 1, proj_w, proj_h), 
-            #     self.backward_proj_grids.reshape(
-            #         batch_size*proj_num, w*d, h, -1
-            #     ),
-            #     align_corners=True,
-            #     padding_mode="zeros"
-            # ).reshape(batch_size, proj_num, w, d, h).detach()
-            
-            # 1) 先把 grid reshape 出来（明确最后一维=2）
-            grid = backward_proj_grids.reshape(
-                batch_size * proj_num, d * h, w, 2
-            )
-
-            # 2) 正常 grid_sample（padding_mode 仍然用 zeros）
-            target_volume_flat = F.grid_sample(
-                target_proj.reshape(batch_size * proj_num, 1, proj_h, proj_w),
-                grid,
-                align_corners=True,
-                padding_mode="zeros"
-                # padding_mode="border"
-            )  # -> (B*P, 1, h*d, w)
-
-            # 3) 计算越界 mask：grid 超出 [-1, 1] 就是 padding 区域
-            invalid = (
-                (grid[..., 0] < -1.0) | (grid[..., 0] > 1.0) |
-                (grid[..., 1] < -1.0) | (grid[..., 1] > 1.0)
-            )  # (B*P, w*d, h)
-
-            # 4) 扩到和输出同形状 (B*P, 1, w*d, h)，并把 padding 区域改成 -1
-            target_volume_flat[invalid.unsqueeze(1)] = -1
-
-            # 5) reshape 回你要的形状
-            target_volume = target_volume_flat.reshape(
-                batch_size, proj_num, d, h, w
-            )
-            target_volume = self.normalize_intensity(target_volume)
         # 拼接输入
         x = torch.cat([moving, target_volume], dim=1)
         

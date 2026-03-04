@@ -59,8 +59,6 @@
             "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca",
             "use_pca": false
         },
-        "continue_train": true,
-        "continue_from": "/data/zhouzhexin/ctdsa/exp_liftreg/train_shift_only/deepfluoro/2026_03_03_17_08_22/checkpoints/model_epoch_1000.pth",
         "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model",
         "network_class": "liftreg.networks.RegistrationNet.RegistrationNet",
         "optim": {

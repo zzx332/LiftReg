@@ -392,7 +392,7 @@ class regUNetTrainer:
     def test_forward(self):
         """测试前向传播"""
         print("\n测试前向传播...")
-        for i in range(10):
+        for i in range(1):
             data = next(iter(self.dataloaders['train']))
             
             self.model.eval()
