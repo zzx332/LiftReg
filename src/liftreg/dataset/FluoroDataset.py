@@ -228,8 +228,9 @@ class FluoroDataset(Dataset):
             target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
             target_proj = sitk.GetArrayFromImage(target_proj)
             target_proj = target_proj.astype(np.float32)
+            # target_proj = np.flip(target_proj, axis=(2))
             target_proj = np.transpose(target_proj, [0, 2, 1])
-            target_proj = self._normalize_intensity(target_proj)[::self.load_projection_interval]
+            # target_proj = self._normalize_intensity(target_proj)[::self.load_projection_interval]
                 # Frame-of-reference change
             if orientation == "AP":
                 # Rotates the C-arm about the x-axis by 90 degrees

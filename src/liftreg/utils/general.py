@@ -16,5 +16,8 @@ def get_class(kls):
 
 def get_git_revisions_hash():
     hashes = []
-    hashes.append(subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip().decode('ascii'))
+    try:
+        hashes.append(subprocess.check_output(['git', 'rev-parse', 'HEAD']).strip().decode('ascii'))
+    except Exception:
+        hashes.append("nogit")
     return hashes

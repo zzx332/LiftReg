@@ -10,6 +10,12 @@ from math import exp
 ###############################################################################
 # Functions
 ###############################################################################
+class MSELoss(nn.Module):
+    """
+    A implementation of the mean squared error (MSE)
+    """
+    def forward(self,input, target):
+        return nn.MSELoss(reduction="mean")(input, target)
 
 class NCCLoss(nn.Module):
     """

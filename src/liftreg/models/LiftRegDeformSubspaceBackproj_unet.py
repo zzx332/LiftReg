@@ -225,17 +225,16 @@ class model(nn.Module):
         disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))  # y
         disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))  # z
         deform_field = disp_norm + self.id_transform
-        warped_source = self.bilinear(moving_cp, deform_field)
-        warped_moving = self.bilinear(moving, deform_field)
-        warped_moving = self.inverse_normalization(warped_moving)
-        warped_moving = self.transform_hu_to_density(warped_moving, bone_attenuation_multiplier=2.0)
+        # warped_source = self.bilinear(moving_cp, deform_field)
+        warped_moving = self.bilinear(density, deform_field)
+        # warped_moving = self.inverse_normalization(warped_moving)
+        # warped_moving = self.transform_hu_to_density(warped_moving, bone_attenuation_multiplier=2.0)
         warped_proj = self.renderer(warped_moving[0, 0], source, target, img_input, **kwargs).view(B,
             -1,
             detector.height,
             detector.width)
-
         model_output = {
-            "warped": warped_source,
+            # "warped": warped_source,
             "warped_moving": warped_moving,
             "phi": deform_field,
             "params": disp_field,
@@ -245,6 +244,31 @@ class model(nn.Module):
             "warped_proj": warped_proj
         }
         return model_output
+
+    def normalize_intensity(self, img, linear_clip=False, clip_range=None):
+        """
+        a numpy image, normalize into intensity [-1,1]
+        (img-img.min())/(img.max() - img.min())
+        :param img: image
+        :param linear_clip:  Linearly normalized image intensities so that the 95-th percentile gets mapped to 0.95; 0 stays 0
+        :return:
+        """
+
+        if linear_clip:
+            if clip_range is not None:
+                img[img<clip_range[0]] = clip_range[0]
+                img[img>clip_range[1]] = clip_range[1]
+                normalized_img = (img-clip_range[0]) / (clip_range[1] - clip_range[0]) 
+            else:
+                img = img - img.min()
+                normalized_img =img / np.percentile(img, 95) * 0.95
+        else:
+            # If we normalize in HU range of softtissue
+            min_intensity = img.min()
+            max_intensity = img.max()
+            normalized_img = (img-img.min())/(max_intensity - min_intensity)
+        normalized_img = normalized_img * 2 - 1
+        return normalized_img
 
     def inverse_normalization(self, img, clip_range=[-1000, 1000]):
         img = (img + 1) / 2
@@ -277,7 +301,7 @@ class model(nn.Module):
         d, h, w = moving.shape[2:]
         B, _, D, H, W = moving.shape
         S, O, U, V = poses
-        
+        target_proj = target_proj.permute(0, 1, 3, 2).flip(dims=[3])
         # 反向投影
         with torch.no_grad():
             backward_proj_grids = backproj_grids_with_SOUV(
@@ -320,12 +344,13 @@ class model(nn.Module):
             )  # (B*P, w*d, h)
 
             # 4) 扩到和输出同形状 (B*P, 1, w*d, h)，并把 padding 区域改成 -1
-            target_volume_flat[invalid.unsqueeze(1)] = -1.0
+            target_volume_flat[invalid.unsqueeze(1)] = -1
 
             # 5) reshape 回你要的形状
             target_volume = target_volume_flat.reshape(
                 batch_size, proj_num, d, h, w
             )
+            target_volume = self.normalize_intensity(target_volume)
         # 拼接输入
         x = torch.cat([moving, target_volume], dim=1)
         

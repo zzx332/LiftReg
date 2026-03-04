@@ -11,7 +11,7 @@ from liftreg.utils import module_parameters as pars
 from liftreg.utils.net_utils import resume_train, save_model
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
-
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 class DummyDataGenerator:
     """虚拟数据生成器"""
@@ -103,10 +103,7 @@ class regUNetTrainer:
         print(f"使用设备: {self.device}, GPU ID: {self.gpu_ids}")
         
         # 创建输出目录
-        timestamp = '{:%Y_%m_%d_%H_%M_%S}'.format(datetime.now())
-        self.output_path = f"./exp_custom/{timestamp}"
-        make_dir(self.output_path)
-        make_dir(os.path.join(self.output_path, "checkpoints"))
+        self.output_path = setting['train']['output_path']
         train_setting = setting['train']
         dataset_setting = setting['dataset']
         self.mode = train_setting[('mode', "train", '\'train\' or \'test\'')]
@@ -158,7 +155,7 @@ class regUNetTrainer:
         self.loss = get_class(train_setting['loss_class'])(setting["train"]["loss"])
         
         # 初始化优化器
-        self._init_optimizer(setting["train"]["optim"])
+        self._init_optim(setting["train"]["optim"])
                 # Resume training if specified.
         if self.mode == 'train':
             self.continue_train = train_setting[('continue_train', False,
@@ -193,24 +190,59 @@ class regUNetTrainer:
         print("初始化完成！")
     
     
-    def _init_optimizer(self, setting):
-        """初始化优化器"""
-        print("初始化优化器...")
+    def _init_optim(self, setting, warmming_up=False):
+        """
+        set optimizers and scheduler
+
+        :param setting: settings on optimizer
+        :param network: model with learnable parameters
+        :param warmming_up: if set as warmming up
+        :return: optimizer, custom scheduler, plateau scheduler
+        """
         optimize_name = setting['optim_type']
         lr = setting['lr']
         beta = setting['adam']['beta']
+        lr_sched_setting = setting[('lr_scheduler', {},
+                            "settings for learning scheduler")]
+        self.lr_sched_type = lr_sched_setting['type']
+
         if optimize_name == 'adam':
             self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr, eps=1e-5, betas=beta)
             # self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=lr, eps=1e-5, betas=beta)
         else:
             self.optimizer = torch.optim.SGD(self.model.parameters(), lr=lr)
-        
-        # 学习率调度器
-        self.scheduler = torch.optim.lr_scheduler.StepLR(
-            self.optimizer,
-            step_size=30,
-            gamma=0.8
-        )
+        self.optimizer.zero_grad()
+
+        if self.lr_sched_type == 'custom':
+            step_size = lr_sched_setting['custom'][('step_size', 50,
+                            "update the learning rate every # epoch")]
+            gamma = lr_sched_setting['custom'][('gamma', 0.5,
+                            "the factor for updateing the learning rate")]
+            self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer,
+                                step_size=step_size, gamma=gamma)
+        elif self.lr_sched_type == 'plateau':
+            patience = lr_sched_setting['plateau']['patience']
+            factor = lr_sched_setting['plateau']['factor']
+            threshold = lr_sched_setting['plateau']['threshold']
+            min_lr = lr_sched_setting['plateau']['min_lr']
+            self.lr_scheduler = ReduceLROnPlateau(self.optimizer,
+                                                    mode='max',
+                                                    patience=patience,
+                                                    factor=factor,
+                                                    verbose=True,
+                                                    threshold=threshold,
+                                                    min_lr=min_lr,
+                                                    cooldown=lr_sched_setting['plateau']['cooldown'])
+
+        if not warmming_up:
+            print(" no warming up the learning rate is {}".format(lr))
+        else:
+            lr = setting['lr']/10
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = lr
+            self.lr_scheduler.base_lrs = [lr]
+            print(" warming up on the learning rate is {}".format(lr))
+
 
     def set_input(self, input):
         """
@@ -264,7 +296,7 @@ class regUNetTrainer:
         loss_dict = {k: v.detach().item() if isinstance(v, torch.Tensor) else v 
                      for k, v in losses.items()}
         
-        return loss_dict
+        return loss_dict, output['params']
     
     def val_step(self, batch):
         """验证步骤"""
@@ -291,19 +323,31 @@ class regUNetTrainer:
             # 训练阶段
             print(f"\nEpoch [{epoch+1}/{self.epochs}]")
             epoch_losses = []
+            reg_losses = []
+            sim_losses = []
             
-            for batch in self.dataloaders['train']:
-                
+            for i, batch in enumerate(self.dataloaders['train']):
+                global_step = epoch * len(self.dataloaders['train']) + i
                 # 训练步骤
-                loss_dict = self.train_step(self.set_input(batch))
+                loss_dict, disp_field = self.train_step(self.set_input(batch))
                 epoch_losses.append(loss_dict['total_loss'])
-                for k,v in loss_dict.items():
-                    self.writer.add_scalar(f"Train/{k}", v, epoch)        
+                reg_losses.append(loss_dict['reg_loss'])
+                sim_losses.append(loss_dict['sim_loss'])
+                # for k,v in loss_dict.items():
+                #     self.writer.add_scalar(f"Train/{k}", v, global_step)        
 
             
             avg_loss = np.mean(epoch_losses)
-            print(f"  平均训练损失: {avg_loss:.4f}")
-            
+            avg_reg_loss = np.mean(reg_losses)
+            avg_sim_loss = np.mean(sim_losses)
+            print(f"  平均total loss: {avg_loss:.4f}")
+            print(f"  平均reg loss: {avg_reg_loss:.4f}")
+            print(f"  平均sim loss: {avg_sim_loss:.4f}")
+            print(f"  max displacement: {disp_field.max():.4f}")
+            print(f"  min displacement: {disp_field.min():.4f}")
+            self.writer.add_scalar("Train/total_loss_epoch", avg_loss, epoch)
+            self.writer.add_scalar("Train/reg_loss_epoch", avg_reg_loss, epoch)
+            self.writer.add_scalar("Train/sim_loss_epoch", avg_sim_loss, epoch)
             # 验证阶段
             if (epoch + 1) % self.val_frequency == 0:
                 print("  执行验证...")
@@ -317,12 +361,12 @@ class regUNetTrainer:
                         print(f"    {key}: {value.shape}")
             
             # 更新学习率
-            self.scheduler.step()
+            self.lr_scheduler.step()
             current_lr = self.optimizer.param_groups[0]['lr']
             print(f"  当前学习率: {current_lr:.6f}")
             
             # 保存检查点
-            if (epoch + 1) % 50 == 0:
+            if (epoch + 1) % 10 == 0:
                 self.save_checkpoint(epoch)
         
         print("\n训练完成！")
@@ -338,9 +382,9 @@ class regUNetTrainer:
         
         torch.save({
             'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
+            'state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
-            'scheduler_state_dict': self.scheduler.state_dict(),
+            'scheduler_state_dict': self.lr_scheduler.state_dict(),
         }, checkpoint_path)
         
         print(f"  保存检查点: {checkpoint_path}")
@@ -348,11 +392,12 @@ class regUNetTrainer:
     def test_forward(self):
         """测试前向传播"""
         print("\n测试前向传播...")
-        data = next(iter(self.dataloaders['train']))
-        
-        self.model.eval()
-        with torch.no_grad():
-            output = self.model(self.set_input(data))
+        for i in range(10):
+            data = next(iter(self.dataloaders['train']))
+            
+            self.model.eval()
+            with torch.no_grad():
+                output = self.model(self.set_input(data))
         
         print("输入形状:")
         for key, value in self.set_input(data).items():

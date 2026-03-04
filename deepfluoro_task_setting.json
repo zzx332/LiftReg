@@ -1,7 +1,7 @@
 {
     "dataset": {
         "apply_hu_clip": true,
-        "data_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg/data/val",
+        "data_path": "/data/zhouzhexin/ctdsa/data/train_shift_only",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
         "img_after_resize": [
@@ -27,7 +27,7 @@
     "train": {
         "check_best_model_frequency": 1,
         "dataloader": {
-            "batch_size": 30,
+            "batch_size": 1,
             "shuffle": [
                 true,
                 true,
@@ -42,11 +42,12 @@
             ]
         },
         "debug_on": true,
-        "epoch": 300,
+        "epoch": 1000,
         "gpu_ids": 0,
         "loss": {
-            "initial_reg_factor": 0.001,
-            "min_reg_factor": 0.001,
+            "sim_factor": 1,
+            "initial_reg_factor": 0.0001,
+            "min_reg_factor": 0.0001,
             "reg_factor_decay_from": 2,
             "sim_class": "liftreg.layers.losses.NCCLoss"
         },
@@ -58,6 +59,8 @@
             "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca",
             "use_pca": false
         },
+        "continue_train": true,
+        "continue_from": "/data/zhouzhexin/ctdsa/exp_liftreg/train_shift_only/deepfluoro/2026_03_03_17_08_22/checkpoints/model_epoch_1000.pth",
         "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model",
         "network_class": "liftreg.networks.RegistrationNet.RegistrationNet",
         "optim": {
@@ -68,11 +71,11 @@
                 ],
                 "weight_decay": 0
             },
-            "lr": 0.001,
+            "lr": 0.0001,
             "lr_scheduler": {
                 "custom": {
                     "gamma": 0.8,
-                    "step_size": 30
+                    "step_size": 60
                 },
                 "plateau": {
                     "cooldown": 2,
@@ -85,7 +88,7 @@
             },
             "optim_type": "adam"
         },
-        "output_path": "D:/dataset/CTA_DSA/DeepFluoro/exp_liftreg_unet",
+        "output_path": "/data/zhouzhexin/ctdsa/exp_liftreg",
         "save_3d_img": false,
         "save_extra_3d_img": false,
         "save_fig": true,
