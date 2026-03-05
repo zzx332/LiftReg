@@ -160,8 +160,29 @@ class model(nn.Module):
         
         self.id_transform = gen_identity_map(self.img_sz, 1.0)
         # self.backward_proj_grids = None
-        renderer_kwargs = {}
-        self.renderer = Siddon(voxel_shift=0.0, **renderer_kwargs)
+        self.render = Siddon(voxel_shift=0.0)
+        reorient = torch.tensor(
+            [
+                [1, 0, 0, 0],
+                [0, 0, 1, 0],
+                [0, 1, 0, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.float32,
+        )
+        self.detector = Detector(
+            1020.0,
+            718,
+            718,
+            0.388,
+            0.388,
+            0,
+            0,
+            reorient,
+            reverse_x_axis=True,
+            n_subsample=None,
+        ).cuda() 
+
     def forward(self, input):
         # Parse input
         moving = input['source']
@@ -179,39 +200,9 @@ class model(nn.Module):
             # target_cp = target
         
         B, _, D, W, H = moving.shape
-        target_poses = RigidTransform(input['target_poses']).cuda()
+        target_poses = input['target_poses']
         density = input['density']
         affine_inverse = input['affine'].inverse().cuda()
-        reorient = torch.tensor(
-            [
-                [1, 0, 0, 0],
-                [0, 0, 1, 0],
-                [0, 1, 0, 0],
-                [0, 0, 0, 1],
-            ],
-            dtype=torch.float32,
-        )
-        detector = Detector(
-            1020.0,
-            718,
-            718,
-            0.388,
-            0.388,
-            0,
-            0,
-            reorient,
-            reverse_x_axis=True,
-            n_subsample=None,
-        ).cuda() 
-        source, target = detector(target_poses, calibration=None)
-        kwargs = {}
-        # Initialize the image with the length of each cast ray
-        img_input = (target - source).norm(dim=-1).unsqueeze(1)
-
-        # Convert rays to voxelspace
-        source = RigidTransform(affine_inverse)(source)
-        target = RigidTransform(affine_inverse)(target)
-
         # 估计形变场
         coefs, disp_field = self._estimate_flow(moving, target_volume)
         
@@ -225,10 +216,10 @@ class model(nn.Module):
         warped_moving = self.bilinear(density, deform_field)
         # warped_moving = self.inverse_normalization(warped_moving)
         # warped_moving = self.transform_hu_to_density(warped_moving, bone_attenuation_multiplier=2.0)
-        warped_proj = self.renderer(warped_moving[0, 0], source, target, img_input, **kwargs).view(B,
+        warped_proj = self.renderer(warped_moving[0, 0], target_poses, affine_inverse).cuda().view(B,
             -1,
-            detector.height,
-            detector.width)
+            self.detector.height,
+            self.detector.width)
         model_output = {
             # "warped": warped_source,
             "warped_moving": warped_moving,
@@ -240,6 +231,16 @@ class model(nn.Module):
             "warped_proj": warped_proj
         }
         return model_output
+        
+    def renderer(self, density, target_poses, affine_inverse):
+        target_poses = RigidTransform(target_poses).cuda()
+        source, target = self.detector(target_poses, calibration=None)
+        # Initialize the image with the length of each cast ray
+        img_input = (target - source).norm(dim=-1).unsqueeze(1)
+        # Convert rays to voxelspace
+        source = RigidTransform(affine_inverse)(source)
+        target = RigidTransform(affine_inverse)(target)
+        return self.render(density, source, target, img_input)
 
     def normalize_intensity(self, img, linear_clip=False, clip_range=None):
         """

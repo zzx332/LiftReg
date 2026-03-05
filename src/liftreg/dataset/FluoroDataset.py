@@ -14,6 +14,8 @@ import torch.nn.functional as F
 
 from torch.utils.data import Dataset
 from torchio import LabelMap, ScalarImage, Subject
+from diffdrr.detector import Detector
+from diffdrr.renderers import Siddon, Trilinear
 from diffdrr.pose import RigidTransform
 from torchio.transforms import Resample
 from ..utils.sdct_projection_utils import backproj_grids_with_SOUV
@@ -58,6 +60,16 @@ class FluoroDataset(Dataset):
         self.target_poses_list = []
         self.target_poses_SOUV_list = []
         self.affine_list = []
+        self.reorient = torch.tensor(
+                    [
+                        [1, 0, 0, 0],
+                        [0, 0, 1, 0],
+                        [0, 1, 0, 0],
+                        [0, 0, 0, 1],
+                    ],
+                    dtype=torch.float32,
+                )
+
         self.init_img_pool()
 
     def get_identifier_list(self):
@@ -86,6 +98,16 @@ class FluoroDataset(Dataset):
         density -= density.min()
         density /= density.max()
         return density
+
+    def renderer(self, density, target_poses, affine_inverse):
+        target_poses = RigidTransform(target_poses)
+        source, target = self.detector(target_poses, calibration=None)
+        # Initialize the image with the length of each cast ray
+        img_input = (target - source).norm(dim=-1).unsqueeze(1)
+        # Convert rays to voxelspace
+        source = RigidTransform(affine_inverse)(source)
+        target = RigidTransform(affine_inverse)(target)
+        return self.render(density, source, target, img_input).view(1, -1, self.detector.height, self.detector.width)
 
     def _resample_image(self, image, new_size, new_spacing, is_label=False):
         """
@@ -137,54 +159,17 @@ class FluoroDataset(Dataset):
        
         return resampler.Execute(image)
 
-    # def _read_case(self, identifier_list, img_label_dic):
-    #     pbar = pb.ProgressBar(widgets=[pb.Percentage(), pb.Bar(), pb.ETA()], maxval=len(identifier_list)).start()
-    #     count = 0
-    #     for identifier in identifier_list:
-    #         img_label_np = {}
-    #         # Pay attention here. Flip is used to transform SAR orientation to SPR orientation.
-    #         # This is only applied to synthetic dataset because the real data has already been transformed in preprocessing script.
-    #         # TODO: Should make such change in preprocess script.
-    #         # source_img = np.flip(np.load(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz")).astype(np.float32), axis=(1))
-    #         source_img = sitk.ReadImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz"))
-    #         source_img = self._resample_image(source_img, [160, 160, 160], [2.2, 2.2, 2.2], is_label=False)
-    #         source_arr = sitk.GetArrayFromImage(source_img)
-    #         # not sure if this is correct
-    #         # source_img = np.flip(source_img, axis=(1))
-    #         source_arr = source_arr.astype(np.float32)
-    #         if self.apply_hu_clip:
-    #             source_arr = self._normalize_intensity(source_arr, linear_clip=True, clip_range=[-1000, 1000])
-    #         else:
-    #             source_arr = self._normalize_intensity(source_arr, linear_clip=True)
-    #         if self.has_label:
-    #             source_seg = sitk.ReadImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source_seg.nii.gz"))
-    #             source_seg = self._resample_image(source_seg, [160, 160, 160], [2.2, 2.2, 2.2], is_label=True)
-    #             source_seg = sitk.GetArrayFromImage(source_seg)                
-    #             # not sure if this is correct
-    #             # source_seg = np.flip(source_seg, axis=(1))
-    #             source_seg = source_seg.astype(np.float32)
-    #             img_label_np['source_seg'] = blosc.pack_array(source_seg)
-    #         else:
-    #             img_label_np['source_seg'] = None
-    #         img_label_np['source'] = blosc.pack_array(source_arr)
+    def _init_projector_if_needed(self):
+        if not hasattr(self, "render") or self.render is None:
+            self.render = Siddon(voxel_shift=0.0)
+        if not hasattr(self, "detector") or self.detector is None:
+            self.detector = Detector(
+                1020.0, 718, 718, 0.388, 0.388, 0, 0,
+                self.reorient, reverse_x_axis=True, n_subsample=None,
+            )
 
-    #         target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
-    #         target_proj = sitk.GetArrayFromImage(target_proj)
-    #         target_proj = target_proj.astype(np.float32)
-    #         target_proj = self._normalize_intensity(target_proj, linear_clip=True, clip_range=(0,6))[::self.load_projection_interval]
-    #         img_label_np['target_proj'] = blosc.pack_array(target_proj)
-
-    #         # Load geo info
-    #         img_label_np['target_poses'] , *_ = torch.load(os.path.join(self.drr_path,  identifier.split("_")[0] + "_pose.pt"), weights_only=False)["pose"][::self.load_projection_interval]
-    #         img_label_np['target_poses'] = self._convert_extrinsic_to_pose(img_label_np['target_poses'], source_img)
-    #         img_label_np["spacing"] = np.array(self.spacing)
-            
-    #         img_label_dic[identifier] = img_label_np
-    #         count += 1
-    #         pbar.update(count)
-    #     pbar.finish()
-
-    def _read_case_polypose(self, identifier_list, img_label_dic, center_volume=True, resample_target=[160, 160, 160], orientation="PA"):
+    def _read_case_polypose(self, identifier_list, img_label_dic, center_volume=True, resample_target=[160, 160, 160]):
+        self._init_projector_if_needed()  # 每个进程只初始化一次
         pbar = pb.ProgressBar(widgets=[pb.Percentage(), pb.Bar(), pb.ETA()], maxval=len(identifier_list)).start()
         count = 0
         for identifier in identifier_list:
@@ -193,41 +178,7 @@ class FluoroDataset(Dataset):
             # This is only applied to synthetic dataset because the real data has already been transformed in preprocessing script.
             # TODO: Should make such change in preprocess script.
             # source_img = np.flip(np.load(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz")).astype(np.float32), axis=(1))
-            if orientation == "AP":
-                # Rotates the C-arm about the x-axis by 90 degrees
-                reorient = torch.tensor(
-                    [
-                        [1, 0, 0, 0],
-                        [0, 0, -1, 0],
-                        [0, 1, 0, 0],
-                        [0, 0, 0, 1],
-                    ],
-                    dtype=torch.float32,
-                )
-            elif orientation == "PA":
-                # Rotates the C-arm about the x-axis by 90 degrees
-                # Reverses the direction of the y-axis
-                reorient = torch.tensor(
-                    [
-                        [1, 0, 0],
-                        [0, 0, 1],
-                        [0, 1, 0],
-                    ],
-                    dtype=torch.float32,
-                )
-            elif orientation is None:
-                # Identity transform
-                reorient = torch.tensor(
-                    [
-                        [1, 0, 0, 0],
-                        [0, 1, 0, 0],
-                        [0, 0, 1, 0],
-                        [0, 0, 0, 1],
-                    ],
-                    dtype=torch.float32,
-                )
-            else:
-                raise ValueError(f"Unrecognized orientation {orientation}")
+
             source_img = ScalarImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source.nii.gz"))
             if self.has_label:
                 source_seg = ScalarImage(os.path.join(self.data_path, identifier.split("_")[0] + "_source_seg.nii.gz"))
@@ -245,7 +196,7 @@ class FluoroDataset(Dataset):
                 source_img = transform(source_img)
                 source_seg = transform(source_seg)
             source_arr = source_img.data.detach().cpu().numpy().astype(np.float32).squeeze(0)
-            # Convert the volume to density
+            # Convert the volume to density            
             density = self.transform_hu_to_density(source_img.data, bone_attenuation_multiplier = 2.0)
             density = ScalarImage(tensor=density, affine=source_img.affine)
             density_arr = density.data.detach().cpu().numpy().astype(np.float32).squeeze(0)
@@ -263,18 +214,26 @@ class FluoroDataset(Dataset):
                 img_label_np['source_seg'] = None
             img_label_np['source'] = blosc.pack_array(source_arr)
             img_label_np['density'] = blosc.pack_array(density_arr)
+            img_label_np["affine"] = torch.as_tensor(source_img.affine, dtype=torch.float32)
             # Load geo info
             img_label_np['target_poses'] , *_ = torch.load(os.path.join(self.drr_path,  identifier.split("_")[0] + "_pose.pt"), weights_only=False)["pose"][::self.load_projection_interval]
-            img_label_np['target_poses_SOUV'] = self._extrinsic_cam2world_to_SOUV(img_label_np['target_poses'], reorient, sdd=1020.0)
-            S, O, U, V = img_label_np['target_poses_SOUV']
-            target_proj = sitk.ReadImage(os.path.join(self.drr_path, identifier+".nii.gz"))
-            target_proj = sitk.GetArrayFromImage(target_proj)
-            target_proj = target_proj.astype(np.float32)
-            device = torch.device("cpu")
+            target_proj = self.renderer(density.data.squeeze(0), img_label_np['target_poses'], img_label_np["affine"].inverse())
+            img_label_np['target_poses_SOUV'] = self._extrinsic_cam2world_to_SOUV(img_label_np['target_poses'], self.reorient[:3,:3], sdd=1020.0)
+            target_proj_squeezed = target_proj.squeeze(0).permute(0, 2, 1).flip(dims=[2])
+            target_volume = self.backproject_volume(img_label_np['target_poses_SOUV'], target_proj_squeezed, source_arr.shape, device = torch.device("cpu"))
+            img_label_np["target_volume"] = blosc.pack_array(target_volume.detach().cpu().numpy())
+            # Frame-of-reference change
+            img_label_np['target_proj'] = blosc.pack_array(target_proj.squeeze(0).detach().cpu().numpy())
+            img_label_np["spacing"] = np.array(self.spacing)
 
-            # 2) 输入投影放到 GPU，显式 dtype
-            target_proj = torch.from_numpy(target_proj).to(device=device, dtype=torch.float32)
+            
+            img_label_dic[identifier] = img_label_np
+            count += 1
+            pbar.update(count)
+        pbar.finish()
 
+    def backproject_volume(self, target_poses_SOUV, target_proj, source_arr_shape, device = torch.device("cpu")):
+            S, O, U, V = target_poses_SOUV
             # 3) SOUV 也统一到同一 device（虽然 backproj_grids_with_SOUV 内部也会 to(device)，这里先统一更稳）
             S = S.to(device=device, dtype=torch.float32)
             O = O.to(device=device, dtype=torch.float32)
@@ -283,7 +242,7 @@ class FluoroDataset(Dataset):
 
             # 4) 反投影网格（GPU）
             backward_proj_grids = backproj_grids_with_SOUV(
-                source_arr.shape,
+                source_arr_shape,
                 S.unsqueeze(0), O.unsqueeze(0), U.unsqueeze(0), V.unsqueeze(0),
                 target_proj.shape[2], target_proj.shape[1],
                 du=0.388, dv=0.388,
@@ -291,38 +250,23 @@ class FluoroDataset(Dataset):
                 cv=(target_proj.shape[1] - 1) / 2.0,
                 device=device,
             )
-
             grid = backward_proj_grids.reshape(
-                1, source_arr.shape[0] * source_arr.shape[1], source_arr.shape[2], 2
+                1, source_arr_shape[0] * source_arr_shape[1], source_arr_shape[2], 2
             )
-            target_proj = target_proj.flip(dims=[2])
             target_volume_flat = F.grid_sample(
                 target_proj.reshape(1, 1, target_proj.shape[1], target_proj.shape[2]),
                 grid,
                 align_corners=True,
                 padding_mode="zeros",
             )
-
             invalid = (
                 (grid[..., 0] < -1.0) | (grid[..., 0] > 1.0) |
                 (grid[..., 1] < -1.0) | (grid[..., 1] > 1.0)
             )
             target_volume_flat = target_volume_flat.masked_fill(invalid.unsqueeze(1), -1.0)
-            target_volume = target_volume_flat.reshape(source_arr.shape[0], source_arr.shape[1], source_arr.shape[2])
+            target_volume = target_volume_flat.reshape(source_arr_shape[0], source_arr_shape[1], source_arr_shape[2])
             target_volume = self._normalize_intensity(target_volume)
-            img_label_np["target_volume"] = blosc.pack_array(target_volume.detach().cpu().numpy())
-            # target_proj = self._normalize_intensity(target_proj)[::self.load_projection_interval]
-            # Frame-of-reference change
-            target_proj = target_proj.flip(dims=[2]).permute(0, 2, 1)
-            img_label_np['target_proj'] = blosc.pack_array(target_proj.detach().cpu().numpy())
-            # img_label_np['target_poses'] = RigidTransform(img_label_np['target_poses'])
-            img_label_np["spacing"] = np.array(self.spacing)
-            img_label_np["affine"] = torch.as_tensor(source_img.affine, dtype=torch.float32)
-            
-            img_label_dic[identifier] = img_label_np
-            count += 1
-            pbar.update(count)
-        pbar.finish()
+            return target_volume
 
     def canonicalize(self, volume):
         isocenter = volume.get_center()
@@ -354,7 +298,7 @@ class FluoroDataset(Dataset):
         img_label_dic = manager.dict()
         # num_of_workers = 12
         num_of_workers = 1
-        num_of_workers = num_of_workers if len(self.identifier_list )>num_of_workers else len(self.identifier_list )
+        num_of_workers = num_of_workers if len(self.identifier_list )>num_of_workers else len(self.identifier_list)
         split_dict = self.__split_dict(self.identifier_list , num_of_workers)
         procs = []
         for i in range(num_of_workers):
