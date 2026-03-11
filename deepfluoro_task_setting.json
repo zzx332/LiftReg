@@ -1,7 +1,7 @@
 {
     "dataset": {
         "apply_hu_clip": true,
-        "data_path": "/data/zhouzhexin/ctdsa/data/train_shift_only",
+        "data_path": "/data/zhouzhexin/ctdsa/data/extracted_data_shift_only1",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
         "img_after_resize": [
@@ -86,7 +86,7 @@
             },
             "optim_type": "adam"
         },
-        "output_path": "/data/zhouzhexin/ctdsa/exp_liftreg",
+        "output_path": "/home/zzx/data/exp_liftreg",
         "save_3d_img": false,
         "save_extra_3d_img": false,
         "save_fig": true,
