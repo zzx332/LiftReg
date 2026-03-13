@@ -15,7 +15,7 @@ which is trained using sets of digitally reconstructed radiographs (DRR) and com
 - [ ] Improve the process to replicate the result
 - [x] Upload subspace basis to cloud drive
 - [x] Upload model weights to cloud drive
-
+ 
 
 ## Setup environment
 ```
