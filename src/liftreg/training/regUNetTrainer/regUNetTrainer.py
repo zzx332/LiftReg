@@ -111,6 +111,7 @@ class regUNetTrainer:
         self.epochs = train_setting[('epoch', 100, 'num of training epoch')]
         self.val_frequency = train_setting[('val_frequency', 20, 'How many epoch per one validation')]
         self.start_epoch = train_setting[('start_epoch', 0, 'start epoch')]
+        self.memory_profile = train_setting[('memory_profile', False, 'Whether to output the GPU memory usage for each key step')]
         # Init dataset and dataloader
         data_path = dataset_setting["data_path"]
         val_data_path = dataset_setting["val_data_path"]
@@ -151,6 +152,8 @@ class regUNetTrainer:
         # Init model.
         self.model = get_class(train_setting['model_class'])(self.input_img_sz, setting["train"]["model"])
         self.model = self.model.to(self.device)
+        if self.memory_profile and hasattr(self.model, 'set_memory_logger'):
+            self.model.set_memory_logger(self._log_cuda_memory)
         self.lr_scheduler = None
         # Init loss.
         self.loss = get_class(train_setting['loss_class'])(setting["train"]["loss"])
@@ -189,7 +192,24 @@ class regUNetTrainer:
         # )
         
         print("初始化完成！")
-    
+    def _format_memory_mb(self, value):
+        return f"{value / (1024 ** 2):.1f}MB"
+
+    def _log_cuda_memory(self, stage):
+        """输出当前 CUDA 显存占用，便于定位峰值发生在哪一步。"""
+        if not self.memory_profile or not torch.cuda.is_available():
+            return
+
+        allocated = torch.cuda.memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        peak = torch.cuda.max_memory_allocated()
+        print(
+            f"[GPU MEM] {stage}: "
+            f"allocated={self._format_memory_mb(allocated)}, "
+            f"reserved={self._format_memory_mb(reserved)}, "
+            f"peak={self._format_memory_mb(peak)}"
+        )
+
     
     def _init_optim(self, setting, warmming_up=False):
         """
@@ -279,19 +299,26 @@ class regUNetTrainer:
     def train_step(self, batch):
         """单步训练"""
         self.model.train()
+        if self.memory_profile and torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         self.optimizer.zero_grad()
+        self._log_cuda_memory("train/after_zero_grad")
         if hasattr(self.model, 'set_cur_epoch'):
             self.model.set_cur_epoch(self.cur_epoch)
         # 前向传播
         output = self.model(batch)
+        self._log_cuda_memory("train/after_forward")
         output["epoch"] = self.cur_epoch
         
         # 计算损失
         losses = self.loss(output)
-        
+        self._log_cuda_memory("train/after_loss")
         # 反向传播
         losses["total_loss"].backward()
+        self._log_cuda_memory("train/after_backward")
         self.optimizer.step()
+        self._log_cuda_memory("train/after_step")
+
         
         # 返回损失值
         loss_dict = {k: v.detach().item() if isinstance(v, torch.Tensor) else v 
@@ -334,7 +361,7 @@ class regUNetTrainer:
             epoch_losses = []
             reg_losses = []
             sim_losses = []
-            
+            disp_stats = None
             for i, batch in enumerate(self.dataloaders['train']):
                 global_step = epoch * len(self.dataloaders['train']) + i
                 # 训练步骤

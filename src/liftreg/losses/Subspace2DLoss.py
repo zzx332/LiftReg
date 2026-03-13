@@ -2,6 +2,7 @@ import mermaid.finite_differences as fdt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from ..utils.utils import sigmoid_decay
 from ..utils.general import get_class
 
@@ -21,6 +22,13 @@ class loss(nn.Module):
         # Parse input data
         warped = input["warped_proj"]
         target = input["target_proj"]
+        if target.shape[-2:] != warped.shape[-2:]:
+            target = F.interpolate(
+                target,
+                size=warped.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
         params = input["params"]
         # pca_coefs = input["pca_coefs"]
         epoch = input["epoch"]

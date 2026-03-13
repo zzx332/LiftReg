@@ -86,7 +86,7 @@ class model(nn.Module):
         self.img_sz = img_sz
         self.gaussian_smooth = GaussianSmoothing(4, 8, 2, dim=2)
         self.bilinear = Bilinear(zero_boundary=True, using_scale=True)
-        
+        self.memory_logger = None
         # Feature channel settings
         base_channels = 16
         enc_channels = [base_channels, base_channels*2, base_channels*4, 
@@ -169,16 +169,35 @@ class model(nn.Module):
         )
         self.detector = Detector(
             1020.0,
-            718,
-            718,
-            0.388,
-            0.388,
+            384,
+            384,
+            0.7255,
+            0.7255,
             0,
             0,
             reorient,
             reverse_x_axis=True,
             n_subsample=None,
-        ).cuda() 
+        ).cuda()
+        # self.detector = Detector(
+        #     1020.0,
+        #     718,
+        #     718,
+        #     0.388,
+        #     0.388,
+        #     0,
+        #     0,
+        #     reorient,
+        #     reverse_x_axis=True,
+        #     n_subsample=None,
+        # ).cuda() 
+
+    def set_memory_logger(self, logger):
+        self.memory_logger = logger
+
+    def _log_memory(self, stage):
+        if self.memory_logger is not None:
+            self.memory_logger(stage)
 
     def forward(self, input):
         # Parse input
@@ -195,28 +214,27 @@ class model(nn.Module):
             # target_cp = target
         
         B, _, W, H, D = moving.shape
-
-        target_poses = input['target_poses']
         density = input['density']
-        affine_inverse = input['affine'].inverse().cuda()
+        target_poses = input['target_poses'].to(density.device)
+        affine_inverse = input['affine'].inverse().to(density.device)
         # Estimating Deformation Fields
         coefs, disp_field = self._estimate_flow(moving, target_volume)
-        
+        self._log_memory("model/after_estimate_flow")
         # Applying Deformation
         disp_norm = disp_field.clone()
         disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))  # x
         disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))  # y
         disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))  # z
         deform_field = disp_norm + self.id_transform
-        # warped_source = self.bilinear(moving_cp, deform_field)
+        self._log_memory("model/after_deform_field")
         warped_moving = self.bilinear(density, deform_field)
-        # warped_moving = self.inverse_normalization(warped_moving)
-        # warped_moving = self.transform_hu_to_density(warped_moving, bone_attenuation_multiplier=2.0)
-        warped_proj = self.renderer(warped_moving[0, 0], target_poses, affine_inverse).cuda().view(B,
+        self._log_memory("model/after_warp")
+        warped_proj = self.renderer(warped_moving[0, 0], target_poses, affine_inverse).view(B,
             -1,
             self.detector.height,
             self.detector.width)
-
+        self._log_memory("model/after_full_projection_render")
+ 
         model_output = {
             # "warped": warped_source,
             "warped_moving": warped_moving,
@@ -230,7 +248,7 @@ class model(nn.Module):
         return model_output
         
     def renderer(self, density, target_poses, affine_inverse):
-        target_poses = RigidTransform(target_poses).cuda()
+        target_poses = RigidTransform(target_poses)
         source, target = self.detector(target_poses, calibration=None)
         # Initialize the image with the length of each cast ray
         img_input = (target - source).norm(dim=-1).unsqueeze(1)

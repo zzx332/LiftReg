@@ -43,6 +43,7 @@
             ]
         },
         "debug_on": true,
+        "memory_profile": false,
         "epoch": 1000,
         "gpu_ids": 0,
         "loss": {
