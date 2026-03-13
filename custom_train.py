@@ -116,7 +116,8 @@ if __name__ == '__main__':
     parser.add_argument('--continue_from',required=False, type=str,
                         help='Which checkpoint we should continue train from')             
     parser.add_argument('-g',"--gpu_id",required=False,type=int,default=0,help='gpu_id to use')
-    
+    parser.add_argument('--test_forward', action='store_true',
+                        help='Perform a forward pass check once before training; disabled by default to avoid additional memory spikes.')
     args = parser.parse_args()
     print(args)
 
@@ -139,7 +140,11 @@ if __name__ == '__main__':
     )
     
     # 测试前向传播
-    trainer.test_forward()
+    if args.test_forward:
+        _ = trainer.test_forward()
+        del _
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
     
     # 开始训练
     trainer.train()

@@ -296,8 +296,12 @@ class regUNetTrainer:
         # 返回损失值
         loss_dict = {k: v.detach().item() if isinstance(v, torch.Tensor) else v 
                      for k, v in losses.items()}
-        
-        return loss_dict, output['params']
+        disp_field = output['params'].detach()
+        disp_stats = {
+            "max": disp_field.max().item(),
+            "min": disp_field.min().item(),
+        }
+        return loss_dict, disp_stats
     
     def val_step(self, batch):
         """验证步骤"""
@@ -310,8 +314,11 @@ class regUNetTrainer:
         
         loss_dict = {k: v.detach().item() if isinstance(v, torch.Tensor) else v 
                      for k, v in losses.items()}
-        
-        return loss_dict, output
+        output_shapes = {
+            k: tuple(v.shape) for k, v in output.items() if isinstance(v, torch.Tensor)
+        }
+
+        return loss_dict, output_shapes
     
     def train(self):
         """训练循环"""
@@ -331,7 +338,7 @@ class regUNetTrainer:
             for i, batch in enumerate(self.dataloaders['train']):
                 global_step = epoch * len(self.dataloaders['train']) + i
                 # 训练步骤
-                loss_dict, disp_field = self.train_step(self.set_input(batch))
+                loss_dict, disp_stats = self.train_step(self.set_input(batch))
                 epoch_losses.append(loss_dict['total_loss'])
                 reg_losses.append(loss_dict['reg_loss'])
                 sim_losses.append(loss_dict['sim_loss'])
@@ -345,22 +352,22 @@ class regUNetTrainer:
             print(f"  平均total loss: {avg_loss:.4f}")
             print(f"  平均reg loss: {avg_reg_loss:.4f}")
             print(f"  平均sim loss: {avg_sim_loss:.4f}")
-            print(f"  max displacement: {disp_field.max():.4f}")
-            print(f"  min displacement: {disp_field.min():.4f}")
+            if disp_stats is not None:
+                print(f"  max displacement: {disp_stats['max']:.4f}")
+                print(f"  min displacement: {disp_stats['min']:.4f}")
             self.writer.add_scalar("Train/total_loss_epoch", avg_loss, epoch)
             self.writer.add_scalar("Train/reg_loss_epoch", avg_reg_loss, epoch)
             self.writer.add_scalar("Train/sim_loss_epoch", avg_sim_loss, epoch)
             # 验证阶段
             if (epoch + 1) % self.val_frequency == 0:
                 print("  执行验证...")
-                val_loss_dict, output = self.val_step(self.set_input(next(val_iter)))
+                val_loss_dict, output_shapes = self.val_step(self.set_input(next(val_iter)))
                 print(f"  验证损失: {val_loss_dict['total_loss']:.4f}")
                 
                 # 打印输出的形状信息
                 print("  输出形状:")
-                for key, value in output.items():
-                    if isinstance(value, torch.Tensor):
-                        print(f"    {key}: {value.shape}")
+                for key, shape in output_shapes.items():
+                    print(f"    {key}: {shape}")
             self.writer.add_scalar("Val/total_loss_epoch", val_loss_dict['total_loss'], epoch)
             # 更新学习率
             self._update_scheduler(val_loss_dict['total_loss'])
