@@ -10,7 +10,7 @@ from diffdrr.renderers import Siddon, Trilinear
 from diffdrr.pose import RigidTransform
 
 class ResidualBlock(nn.Module):
-    """残差块"""
+    """Residual block"""
     def __init__(self, in_channels, out_channels, stride=1):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, 
@@ -21,7 +21,7 @@ class ResidualBlock(nn.Module):
                                stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm3d(out_channels)
         
-        # 残差连接的投影层
+        # Residual connection projection layer
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
@@ -43,7 +43,7 @@ class ResidualBlock(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    """编码器块（下采样）"""
+    """Encoder block (downsampling)"""
     def __init__(self, in_channels, out_channels, stride=2):
         super(EncoderBlock, self).__init__()
         self.res_block = ResidualBlock(in_channels, out_channels, stride=stride)
@@ -53,7 +53,7 @@ class EncoderBlock(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    """解码器块（上采样 + 跳跃连接）"""
+    """Decoder block (upsampling + skip connection)"""
     def __init__(self, in_channels, skip_channels, out_channels):
         super(DecoderBlock, self).__init__()
         self.upsample = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
@@ -87,48 +87,48 @@ class model(nn.Module):
         self.gaussian_smooth = GaussianSmoothing(4, 8, 2, dim=2)
         self.bilinear = Bilinear(zero_boundary=True, using_scale=True)
         
-        # 特征通道数设置
+        # Feature channel settings
         base_channels = 16
         enc_channels = [base_channels, base_channels*2, base_channels*4, 
                        base_channels*8, base_channels*8, base_channels*8]
         
-        # ===== 编码器路径 (Encoder Path) =====
+        # ===== Encoder Path (Encoder Path) =====
         self.encoders = nn.ModuleList()
         
-        # 初始卷积（不下采样）
+        # Initial convolution (no downsampling)
         self.init_conv = ResidualBlock(
-            opt["drr_feature_num"]+1,  # 输入通道：proj_num + 1
+            opt["drr_feature_num"]+1,  # Input channels: proj_num + 1
             enc_channels[0], 
             stride=1
         )
         
-        # 编码器块（逐步下采样）
+        # Encoder blocks (gradually downsampling)
         for i in range(len(enc_channels)-1):
             self.encoders.append(
                 EncoderBlock(enc_channels[i], enc_channels[i+1], stride=2)
             )
         
-        # ===== 瓶颈层 (Bottleneck) =====
+        # ===== Bottleneck Layer (Bottleneck) =====
         bottleneck_channels = enc_channels[-1]
         self.bottleneck = ResidualBlock(bottleneck_channels, bottleneck_channels, stride=1)
         
-        # ===== 解码器路径 (Decoder Path) =====
+        # ===== Decoder Path (Decoder Path) =====
         self.decoders = nn.ModuleList()
-        dec_channels = enc_channels[::-1]  # 反转通道数列表
+        dec_channels = enc_channels[::-1]  # Reverse channel number list
         
         for i in range(len(dec_channels)-1):
             self.decoders.append(
                 DecoderBlock(
-                    dec_channels[i],      # 输入通道
-                    dec_channels[i+1],    # 跳跃连接通道
-                    dec_channels[i+1]     # 输出通道
+                    dec_channels[i],      # Input channels
+                    dec_channels[i+1],    # Skip connection channels
+                    dec_channels[i+1]     # Output channels
                 )
             )
         
-        # ===== 输出层 =====
-        # 方案1: 使用 PCA 子空间（保持原有方式）
+        # ===== Output Layer =====
+        # Solution 1: Using PCA subspace (keep original way)
         if opt["use_pca"]:
-            # 全局平均池化 + 全连接层
+            # Global average pooling + fully connected layers
             self.use_pca = True
             self.global_pool = nn.AdaptiveAvgPool3d(1)
             self.fc_layers = nn.Sequential(
@@ -138,7 +138,7 @@ class model(nn.Module):
                 nn.Linear(256, opt["latent_dim"])
             )
             
-            # 加载 PCA 组件
+            # Load PCA components
             self.pca_vectors = torch.from_numpy(
                 np.load(f"{opt['pca_path']}/pca_vectors.npy").T
             ).float().cuda()
@@ -146,10 +146,10 @@ class model(nn.Module):
                 np.load(f"{opt['pca_path']}/pca_mean.npy")
             ).float().cuda()
         else:
-            # 方案2: 直接输出 displacement field
+            # Solution 2: Directly output displacement field
             self.use_pca = False
             self.output_conv = nn.Conv3d(
-                base_channels, 3,  # 输出3通道 (x, y, z displacement)
+                base_channels, 3,  # Output 3 channels (x, y, z displacement)
                 kernel_size=3, padding=1
             )
             self.output_conv.weight.data.normal_(mean=0.0, std=1e-5)
@@ -199,10 +199,10 @@ class model(nn.Module):
         target_poses = input['target_poses']
         density = input['density']
         affine_inverse = input['affine'].inverse().cuda()
-        # 估计形变场
+        # Estimating Deformation Fields
         coefs, disp_field = self._estimate_flow(moving, target_volume)
         
-        # 应用形变
+        # Applying Deformation
         disp_norm = disp_field.clone()
         disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))  # x
         disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))  # y
@@ -281,7 +281,7 @@ class model(nn.Module):
         density[soft_tissue] = volume[soft_tissue]
         density[bone] = volume[bone] * bone_attenuation_multiplier
 
-        # 关键：避免 in-place 算术，改成 out-of-place
+        # Important: avoid in-place arithmetic, change to out-of-place
         density_min = density.min()
         density = density - density_min
         density_max = density.max()
@@ -290,41 +290,41 @@ class model(nn.Module):
         return density
 
     def _estimate_flow(self, moving, target_volume):
-        """使用 ResUNet 估计形变场"""
+        """Estimating Deformation Fields using ResUNet"""
         B, _, W, H, D = moving.shape
 
-        # 拼接输入
+        # Concatenate input
         x = torch.cat([moving, target_volume], dim=1)
         
-        # ===== 编码器路径 =====
+        # ===== Encoder Path =====
         x = self.init_conv(x)
         
-        # 保存跳跃连接
+        # Save skip connections
         skip_connections = [x]
         
         for encoder in self.encoders:
             x = encoder(x)
             skip_connections.append(x)
         
-        # ===== 瓶颈层 =====
+        # ===== Bottleneck Layer =====
         x = self.bottleneck(x)
         
-        # ===== 解码器路径 =====
-        skip_connections = skip_connections[::-1][1:]  # 反转并移除最后一个
+        # ===== Decoder Path =====
+        skip_connections = skip_connections[::-1][1:]  # Reverse and remove the last one
         
         for i, decoder in enumerate(self.decoders):
             x = decoder(x, skip_connections[i])
         
-        # ===== 输出层 =====
+        # ===== Output Layer =====
         if self.use_pca:
-            # 使用 PCA 子空间
+            # Using PCA subspace
             features = self.global_pool(x)
             coefs = self.fc_layers(features)
             disp_field = F.linear(coefs, self.pca_vectors, self.pca_mean).reshape(
                 B, 3, D, H, W
             )
         else:
-            # 直接输出 displacement field
+            # Directly output displacement field
             disp_field = self.output_conv(x)
             coefs = None
         
