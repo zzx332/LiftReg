@@ -25,6 +25,7 @@ def prepare(args):
     output_path = args.output_path
     exp_name = args.exp_name
     data_path = args.data_path
+    val_data_path = args.val_data_path
     setting_path = args.setting_path
     continue_from = args.continue_from
     is_continue = True if continue_from is not None else False
@@ -55,6 +56,7 @@ def prepare(args):
 
     # Update setting file with command input
     setting["dataset"]["data_path"] = data_path
+    setting["dataset"]["val_data_path"] = val_data_path
     setting["train"]["output_path"] = exp_folder_path
     if is_continue:
         setting["train"]["continue_train"] = True
@@ -105,6 +107,8 @@ if __name__ == '__main__':
                         default=None,help='the path of output folder')
     parser.add_argument('-d','--data_path', required=True, type=str,
                         default='',help='the path to the data folder')
+    parser.add_argument('-v','--val_data_path', required=True, type=str,
+                        default='',help='the path to the validation data folder')
     parser.add_argument('-e','--exp_name', required=True, type=str,
                         default=None,help='the name of the experiment')
     parser.add_argument('-s','--setting_path', required=True, type=str,

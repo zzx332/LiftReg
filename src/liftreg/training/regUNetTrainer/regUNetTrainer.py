@@ -109,10 +109,11 @@ class regUNetTrainer:
         self.mode = train_setting[('mode', "train", '\'train\' or \'test\'')]
         self.log_path = os.path.join(self.output_path, "logs")
         self.epochs = train_setting[('epoch', 100, 'num of training epoch')]
-        self.val_frequency = train_setting[('val_frequency', 10, 'How many epoch per one validation')]
+        self.val_frequency = train_setting[('val_frequency', 20, 'How many epoch per one validation')]
         self.start_epoch = train_setting[('start_epoch', 0, 'start epoch')]
         # Init dataset and dataloader
         data_path = dataset_setting["data_path"]
+        val_data_path = dataset_setting["val_data_path"]
         batch_size = train_setting["dataloader"]["batch_size"]
         shuffle = train_setting["dataloader"]["shuffle"]
         workers = train_setting["dataloader"]["workers"]
@@ -120,19 +121,19 @@ class regUNetTrainer:
         dataset_class = get_class(dataset_setting["dataset_class"])
         if self.mode == "train":
             self.dataset = {'train': dataset_class(data_path, phase="train", 
+                                                option=dataset_setting),
+                            'val': dataset_class(val_data_path, phase='val',
                                                 option=dataset_setting)}
-                            # 'val': dataset_class(data_path, phase='val',
-                            #                     option=dataset_setting),
                             # 'debug': dataset_class(data_path, phase='debug',
                             #                     option=dataset_setting)}
             self.dataloaders = {'train': DataLoader(self.dataset["train"],
                                                 batch_size=batch_size,
                                                 shuffle=shuffle[0],
-                                                num_workers=workers[0])}
-                            # 'val': DataLoader(self.dataset["val"],
-                            #                   batch_size=batch_size,
-                            #                   shuffle=shuffle[1],
-                            #                   num_workers=workers[1]),
+                                                num_workers=workers[0])
+                            , 'val': DataLoader(self.dataset["val"],
+                                              batch_size=batch_size,
+                                              shuffle=shuffle[1],
+                                              num_workers=workers[1])}
                             # 'debug': DataLoader(self.dataset["debug"],
                             #                    batch_size=batch_size,
                             #                    shuffle=shuffle[2],
@@ -226,7 +227,7 @@ class regUNetTrainer:
             threshold = lr_sched_setting['plateau']['threshold']
             min_lr = lr_sched_setting['plateau']['min_lr']
             self.lr_scheduler = ReduceLROnPlateau(self.optimizer,
-                                                    mode='max',
+                                                    mode='min',
                                                     patience=patience,
                                                     factor=factor,
                                                     verbose=True,
@@ -316,7 +317,8 @@ class regUNetTrainer:
         """训练循环"""
         print(f"\n开始训练 - {self.epochs} 个 epoch")
         print("=" * 60)
-        
+        val_loss_dict = {'total_loss': 0}
+        val_iter = iter(self.dataloaders['val'])
         for epoch in tqdm(range(self.start_epoch, self.epochs+1)):
             self.cur_epoch = epoch
             self.writer.add_scalar("lr", self.optimizer.param_groups[0]['lr'], epoch)
@@ -351,7 +353,7 @@ class regUNetTrainer:
             # 验证阶段
             if (epoch + 1) % self.val_frequency == 0:
                 print("  执行验证...")
-                val_loss_dict, output = self.val_step(self.set_input(batch))
+                val_loss_dict, output = self.val_step(self.set_input(next(val_iter)))
                 print(f"  验证损失: {val_loss_dict['total_loss']:.4f}")
                 
                 # 打印输出的形状信息
@@ -359,14 +361,16 @@ class regUNetTrainer:
                 for key, value in output.items():
                     if isinstance(value, torch.Tensor):
                         print(f"    {key}: {value.shape}")
-            
+            self.writer.add_scalar("Val/total_loss_epoch", val_loss_dict['total_loss'], epoch)
             # 更新学习率
-            self.lr_scheduler.step()
+            self._update_scheduler(val_loss_dict['total_loss'])
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = max(param_group['lr'], 1e-6)
             current_lr = self.optimizer.param_groups[0]['lr']
             print(f"  当前学习率: {current_lr:.6f}")
             
             # 保存检查点
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 20 == 0:
                 self.save_checkpoint(epoch)
         
         print("\n训练完成！")
@@ -388,13 +392,20 @@ class regUNetTrainer:
         }, checkpoint_path)
         
         print(f"  保存检查点: {checkpoint_path}")
-    
+
+    def _update_scheduler(self, epoch_val_loss):
+        if self.lr_scheduler is not None and self.cur_epoch > 0:
+            if isinstance(self.lr_scheduler, ReduceLROnPlateau):
+                self.lr_scheduler.step(epoch_val_loss)
+            else:
+                self.lr_scheduler.step()
+
     def test_forward(self):
         """测试前向传播"""
         print("\n测试前向传播...")
+        test_iter = iter(self.dataloaders['train'])
         for i in range(1):
-            data = next(iter(self.dataloaders['train']))
-            
+            data = next(test_iter)
             self.model.eval()
             with torch.no_grad():
                 output = self.model(self.set_input(data))

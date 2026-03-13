@@ -133,7 +133,7 @@ class FluoroDataset(Dataset):
         # source_img = ScalarImage(
         #     os.path.join(self.data_path,
         #                  identifier.split('_')[0] + '_source.nii.gz'))
-        source_img = ScalarImage(volume)
+        source_img = ScalarImage(volume) # X, Y, Z
         source_seg = ScalarImage(mask)
         source_img = self.canonicalize(source_img)
         source_seg = self.canonicalize(source_seg)
@@ -149,7 +149,7 @@ class FluoroDataset(Dataset):
         if self.has_label and source_seg is not None:
             source_seg = tfm(source_seg)
 
-        # (D, H, W) float32 numpy
+
         source_arr = source_img.data.squeeze(0).numpy().astype(np.float32)
         if self.apply_hu_clip:
             source_arr = self._normalize_intensity(
@@ -168,12 +168,12 @@ class FluoroDataset(Dataset):
             os.path.join(self.drr_path,
                          identifier.split('_')[0] + '_pose.pt'),
             weights_only=False)['pose'][::self.load_projection_interval]
-
+        # render要求的输入图像是xyz顺序
         # target_proj_t = self._run_renderer(
         #     density_t.squeeze(0), target_poses, affine.inverse())
         target_proj_t = sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(self.drr_path,
                          identifier + '.nii.gz')))
-        target_proj_t = np.transpose(target_proj_t, (0, 2, 1))              
+        target_proj_t = np.transpose(target_proj_t, (0, 2, 1))  # 把 proj变成hw顺序            
         # (1, P, H, W) → squeeze batch → (P, H, W)
         # target_proj_np = (target_proj_t.squeeze(0)
                         #   .detach().cpu().numpy().astype(np.float32))
@@ -182,18 +182,19 @@ class FluoroDataset(Dataset):
         # ---- 3. Back-project 2D → 3D volume ----
         target_poses_SOUV = self._extrinsic_cam2world_to_SOUV(
             target_poses, self.reorient[:3, :3], sdd=1020.0)
-        proj_for_bp = (torch.from_numpy(target_proj_np)
-                       .permute(0, 2, 1).flip(dims=[2]))
+        # proj_for_bp = (torch.from_numpy(target_proj_np)
+        #                .permute(0, 2, 1).flip(dims=[2]))
+        proj_for_bp = torch.from_numpy(target_proj_np).flip(dims=[1])
         target_volume = self.backproject_volume(
             target_poses_SOUV, proj_for_bp, source_arr.shape,
-            device=torch.device('cpu'))
-        target_volume_np = target_volume.detach().cpu().numpy().astype(np.float32)
+            device=torch.device('cpu')).permute(2, 1, 0) # (X, Y, Z)
+        target_volume_np = target_volume.detach().cpu().numpy().astype(np.float32) # (X, Y, Z)
 
         # ---- 4. Save to disk ----
         save_dict = dict(
             source=source_arr,
             density=density_arr,
-            target_proj=target_proj_np,
+            target_proj=target_proj_np, # (P, H, W)
             target_volume=target_volume_np,
             spacing=np.array(self.spacing, dtype=np.float32),
         )
@@ -374,24 +375,28 @@ class FluoroDataset(Dataset):
 
         # ---- Online augmentation (train phase only) ----
         if self.enable_aug:
-            if np.random.rand() < self.aug_lr_flip_prob:
-                (source, density, source_seg, weights,
-                 target_proj, target_volume, affine) = self._apply_lr_flip(
-                    source, density, source_seg, weights,
-                    target_proj, target_volume, affine)
+            # if np.random.rand() < self.aug_lr_flip_prob:
+            #     (source, density, source_seg, weights,
+            #      target_proj, target_volume, affine) = self._apply_lr_flip(
+            #         source, density, source_seg, weights,
+            #         target_proj, target_volume, affine)
 
             source_aug        = self._augment_3d_intensity(source)
             # density       = self._augment_3d_intensity(density)
             # target_volume = self._augment_3d_intensity(target_volume)
             target_proj_aug, aug_tag = self._augment_2d_proj(target_proj)
             if aug_tag:
-                proj_for_bp = (torch.from_numpy(target_proj_aug)
-                       .permute(0, 2, 1).flip(dims=[2]))
+                proj_for_bp = (torch.from_numpy(target_proj_aug).flip(dims=[1]))
                 target_volume_aug = self.backproject_volume(
                     meta['target_poses_SOUV'], proj_for_bp, source.shape,
                     device=torch.device('cpu'))
+                target_volume_aug = np.transpose(target_volume_aug, (2, 1, 0))
             else:
                 target_volume_aug = target_volume
+        else:
+            source_aug = source
+            target_volume_aug = target_volume
+            target_proj_aug = target_proj
         # ---- Build sample dict (add channel dim to 3D volumes) ----
         sample = {
             'source':            np.expand_dims(source_aug,        0),  # (1,D,H,W)
@@ -443,7 +448,7 @@ class FluoroDataset(Dataset):
             cu=(target_proj.shape[2] - 1) / 2.0,
             cv=(target_proj.shape[1] - 1) / 2.0,
             device=device,
-        )
+        ) # (Z, Y, X, 2)
         grid = grids.reshape(
             1, source_arr_shape[0] * source_arr_shape[1], source_arr_shape[2], 2)
         flat = F.grid_sample(

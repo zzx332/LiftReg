@@ -56,23 +56,18 @@ class DecoderBlock(nn.Module):
     """解码器块（上采样 + 跳跃连接）"""
     def __init__(self, in_channels, skip_channels, out_channels):
         super(DecoderBlock, self).__init__()
-        # 上采样
-        self.upsample = nn.ConvTranspose3d(
-            in_channels, in_channels, 
-            kernel_size=2, stride=2
-        )
-        # 融合跳跃连接后的残差块
+        self.upsample = nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
         self.res_block = ResidualBlock(
-            in_channels + skip_channels, 
-            out_channels, 
-            stride=1
+            in_channels + skip_channels,
+            out_channels,
+            stride=1,
         )
-    
+        self.res_block.relu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
     def forward(self, x, skip):
         x = self.upsample(x)
-        # 确保尺寸匹配
-        if x.shape != skip.shape:
-            x = F.interpolate(x, size=skip.shape[2:], mode='trilinear', align_corners=True)
+        if x.shape[2:] != skip.shape[2:]:
+            x = F.interpolate(x, size=skip.shape[2:], mode="trilinear", align_corners=False)
         x = torch.cat([x, skip], dim=1)
         x = self.res_block(x)
         return x
@@ -157,6 +152,8 @@ class model(nn.Module):
                 base_channels, 3,  # 输出3通道 (x, y, z displacement)
                 kernel_size=3, padding=1
             )
+            self.output_conv.weight.data.normal_(mean=0.0, std=1e-5)
+            self.output_conv.bias.data.zero_()
         
         self.id_transform = gen_identity_map(self.img_sz, 1.0)
         # self.backward_proj_grids = None
@@ -186,10 +183,8 @@ class model(nn.Module):
     def forward(self, input):
         # Parse input
         moving = input['source']
-        # target = input['target']
         target_proj = input["target_proj"]
         target_volume = input["target_volume"]
-        
         if 'source_label' in input:
             moving_seg = input['source_label']
             # target_seg = input['target_label']
@@ -199,7 +194,8 @@ class model(nn.Module):
             moving_cp = moving
             # target_cp = target
         
-        B, _, D, W, H = moving.shape
+        B, _, W, H, D = moving.shape
+
         target_poses = input['target_poses']
         density = input['density']
         affine_inverse = input['affine'].inverse().cuda()
@@ -220,6 +216,7 @@ class model(nn.Module):
             -1,
             self.detector.height,
             self.detector.width)
+
         model_output = {
             # "warped": warped_source,
             "warped_moving": warped_moving,
@@ -294,7 +291,7 @@ class model(nn.Module):
 
     def _estimate_flow(self, moving, target_volume):
         """使用 ResUNet 估计形变场"""
-        B, _, D, H, W = moving.shape
+        B, _, W, H, D = moving.shape
 
         # 拼接输入
         x = torch.cat([moving, target_volume], dim=1)

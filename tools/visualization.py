@@ -57,22 +57,23 @@ def get_projection_for_backprojection(sample):
     if proj.ndim == 2:
         proj = proj.unsqueeze(0)
     # proj_bp = proj.permute(0, 2, 1).flip(dims=[2])
-    proj_bp = proj.permute(0, 2, 1)
-    # proj_bp = proj
+    # proj_bp = proj.permute(0, 2, 1)
+    proj_bp = proj.flip(dims=[1])
     return proj_bp[0].detach().cpu().numpy()  # [H, W]
 
 def get_mask_projection_for_detector(dataset, sample):
-    label_3d = torch.as_tensor(sample["source_label"], dtype=torch.float32).squeeze(0)  # [D,H,W]
+    label_3d = torch.as_tensor(sample["source_label"], dtype=torch.float32).squeeze(0)  # [X,Y,Z]
     affine_inv = torch.as_tensor(sample["affine"], dtype=torch.float32).inverse()
     target_poses = sample["target_poses"]
     dataset._init_projector_if_needed()
     # 3D mask -> 2D projection，输出通常是 [1, P, H, W]
-    mask_proj = dataset.renderer(label_3d, target_poses, affine_inv)
+    mask_proj = dataset._run_renderer(label_3d, target_poses, affine_inv)
 
     # 和你 target_proj / backprojection 使用同一套方向变换
     # mask_proj = mask_proj.squeeze(0).permute(0, 2, 1).flip(dims=[2])
-    mask_proj = mask_proj.squeeze(0).permute(0, 2, 1)
-    # mask_proj = mask_proj.squeeze(0)
+    # mask_proj = mask_proj.squeeze(0).permute(0, 2, 1)
+    # mask_proj = mask_proj.squeeze(0).permute(0, 2, 1)
+    mask_proj = mask_proj.squeeze(0).flip(dims=[1])
 
     # 先看第一个投影
     mask_proj_2d = mask_proj[0].detach().cpu().numpy()
@@ -135,6 +136,7 @@ def add_target_volume(plotter, sample, spacing):
 
     # PyVista 是 x,y,z；你的数组是 D,H,W，所以先转成 W,H,D
     volume_xyz = np.transpose(target_volume, (2, 1, 0))
+    # volume_xyz = target_volume
 
     grid = pv.ImageData()
     grid.dimensions = np.array(volume_xyz.shape) + 1  # 作为 cell_data
@@ -153,14 +155,16 @@ def add_target_volume(plotter, sample, spacing):
     )
 
 def add_label_surface(plotter, sample):
-    label = to_numpy(sample["source_label"])[0].astype(np.float32)  # [D,H,W]
+    label = to_numpy(sample["source_label"])[0].astype(np.float32)  # X, Y, Z
     affine = to_numpy(sample["affine"]).astype(np.float32)
-    D, H, W = label.shape
-    label = np.transpose(label, (2, 1, 0))
+    # D, H, W = label.shape
+    W, H, D = label.shape
+    # label = np.transpose(label, (2, 1, 0))
     # 不做 transpose，直接按 [D,H,W] 建格子
     # PyVista x=D, y=H, z=W，与 affine 期望的 (D,H,W) 一致
     grid = pv.ImageData()
-    grid.dimensions = np.array([D, H, W]) + 1
+    # grid.dimensions = np.array([D, H, W]) + 1
+    grid.dimensions = np.array([W, H, D]) + 1
     grid.spacing = (1.0, 1.0, 1.0)
     grid.origin = (0.0, 0.0, 0.0)
     grid.cell_data["label"] = label.flatten(order="F")
@@ -258,7 +262,7 @@ def main():
     p.add_title(f"Backprojection Visualization: {fname}")
 
     # 体数据：先只画包围盒，最清楚
-    # p.add_mesh(box, style="wireframe", color="red", line_width=2)
+    p.add_mesh(box, style="wireframe", color="red", line_width=2)
 
     # X-ray source
     p.add_mesh(pv.Sphere(radius=3.0, center=S), color="orange")
@@ -281,13 +285,14 @@ def main():
     p.add_mesh(mask_contour, color="lime", line_width=3)
     # 射线示意
     # add_detector_rays(p, S, O, U, V, proj_2d, stride=90)
-    # add_target_volume(p, sample, spacing)
-    # add_label_surface(p, sample)
+    add_target_volume(p, sample, spacing)
+    add_label_surface(p, sample)
     # # 反投影切片：体素 -> detector 落点
     # add_backprojection_slice(p, sample, S, O, U, V, proj_2d, spacing)
 
     # p.show()
-    output_dir = os.path.join("/data/zhouzhexin/ctdsa", "visualization")
+    # output_dir = os.path.join("/data/zhouzhexin/ctdsa", "visualization")
+    output_dir = "/home/zzx/data/exp_liftreg/extracted_data_shift_only1/deepfluoro/2026_03_10_18_21_18/tests"
     os.makedirs(output_dir, exist_ok=True)
 
     html_path = os.path.join(output_dir, f"{fname}_backprojection.html")
