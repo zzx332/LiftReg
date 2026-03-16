@@ -13,85 +13,6 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-class DummyDataGenerator:
-    """虚拟数据生成器"""
-    
-    def __init__(self, img_size=(160, 160, 160), proj_size=(160, 160), 
-                 num_projections=40, batch_size=2):
-        self.img_size = img_size
-        self.proj_size = proj_size
-        self.num_projections = num_projections
-        self.batch_size = batch_size
-        
-        # 生成虚拟的 PCA 参数（如果不存在）
-        self._prepare_pca_data()
-    
-    def _prepare_pca_data(self):
-        """准备 PCA 数据（如果不存在则创建虚拟数据）"""
-        pca_path = "D:/dataset/CTA_DSA/DeepFluoro/pca"
-        if not os.path.exists(pca_path):
-            os.makedirs(pca_path)
-        
-        # 如果PCA文件不存在，创建虚拟的PCA参数
-        pca_vectors_path = os.path.join(pca_path, "pca_vectors.npy")
-        pca_mean_path = os.path.join(pca_path, "pca_mean.npy")
-        
-        if not os.path.exists(pca_vectors_path):
-            print("创建虚拟 PCA vectors...")
-            # latent_dim=56, output_dim=3*160*160*160
-            D, W, H = self.img_size
-            latent_dim = 56
-            pca_vectors = np.random.randn(3*D*W*H, latent_dim).astype(np.float32) * 0.01
-            np.save(pca_vectors_path, pca_vectors)
-            print(f"保存到: {pca_vectors_path}")
-        
-        if not os.path.exists(pca_mean_path):
-            print("创建虚拟 PCA mean...")
-            D, W, H = self.img_size
-            pca_mean = np.zeros(3*D*W*H, dtype=np.float32)
-            np.save(pca_mean_path, pca_mean)
-            print(f"保存到: {pca_mean_path}")
-    
-    def generate_batch(self, device='cuda'):
-        """生成一个批次的虚拟数据"""
-        B = self.batch_size
-        D, W, H = self.img_size
-        proj_w, proj_h = self.proj_size
-        proj_num = self.num_projections
-        
-        # 生成随机的3D图像 (归一化到 [-1, 1])
-        source = torch.randn(B, 1, D, W, H, device=device) * 0.5
-        target = source + torch.randn(B, 1, D, W, H, device=device) * 0.1  # 略有不同
-        
-        # 生成随机的投影图像
-        target_proj = torch.randn(B, proj_num, proj_w, proj_h, device=device).abs() * 0.5
-        
-        # 生成相机位姿 (X, Y, Z 坐标)
-        # Y 轴是光源到探测器的方向，通常为正值
-        target_poses = torch.zeros(B, proj_num, 3, device=device)
-        target_poses[:, :, 0] = torch.linspace(-50, 50, proj_num)  # X 方向旋转
-        target_poses[:, :, 1] = 300.0  # Y 方向（光源距离）
-        target_poses[:, :, 2] = torch.linspace(-30, 30, proj_num)  # Z 方向旋转
-        
-        # 可选：生成分割标签
-        source_label = (torch.randn(B, 1, D, W, H, device=device) > 0.5).float()
-        target_label = (torch.randn(B, 1, D, W, H, device=device) > 0.5).float()
-        
-        # 生成 spacing 信息
-        spacing = np.array([2.2, 2.2, 2.2])
-        
-        batch = {
-            'source': source,
-            'target': target,
-            'target_proj': target_proj,
-            'target_poses': target_poses,
-            'source_label': source_label,
-            'target_label': target_label,
-            'spacing': spacing
-        }
-        
-        return batch
-
 class regUNetTrainer:
     """自定义训练器"""
     
@@ -183,13 +104,6 @@ class regUNetTrainer:
             self.start_epoch, self.global_step = resume_train(test_from, self.model, self.optimizer, self.lr_scheduler)
         
         self.cur_epoch = self.start_epoch
-        # # 数据生成器
-        # self.data_generator = DummyDataGenerator(
-        #     img_size=img_size,
-        #     proj_size=(160, 160),
-        #     num_projections=num_projections,
-        #     batch_size=2
-        # )
         
         print("初始化完成！")
     def _format_memory_mb(self, value):
@@ -352,7 +266,6 @@ class regUNetTrainer:
         print(f"\n开始训练 - {self.epochs} 个 epoch")
         print("=" * 60)
         val_loss_dict = {'total_loss': 0}
-        val_iter = iter(self.dataloaders['val'])
         for epoch in tqdm(range(self.start_epoch, self.epochs+1)):
             self.cur_epoch = epoch
             self.writer.add_scalar("lr", self.optimizer.param_groups[0]['lr'], epoch)
@@ -371,7 +284,6 @@ class regUNetTrainer:
                 sim_losses.append(loss_dict['sim_loss'])
                 # for k,v in loss_dict.items():
                 #     self.writer.add_scalar(f"Train/{k}", v, global_step)        
-
             
             avg_loss = np.mean(epoch_losses)
             avg_reg_loss = np.mean(reg_losses)
@@ -385,16 +297,19 @@ class regUNetTrainer:
             self.writer.add_scalar("Train/total_loss_epoch", avg_loss, epoch)
             self.writer.add_scalar("Train/reg_loss_epoch", avg_reg_loss, epoch)
             self.writer.add_scalar("Train/sim_loss_epoch", avg_sim_loss, epoch)
+            if (epoch + 1) % 20 == 0:
+                self.save_checkpoint(epoch)
             # 验证阶段
             if (epoch + 1) % self.val_frequency == 0:
                 print("  执行验证...")
-                val_loss_dict, output_shapes = self.val_step(self.set_input(next(val_iter)))
-                print(f"  验证损失: {val_loss_dict['total_loss']:.4f}")
-                
-                # 打印输出的形状信息
-                print("  输出形状:")
-                for key, shape in output_shapes.items():
-                    print(f"    {key}: {shape}")
+                self.model.eval()
+                val_losses = []
+                with torch.no_grad():
+                    for val_batch in self.dataloaders['val']:  # 每次验证都是新的迭代
+                        loss_dict, output_shapes = self.val_step(self.set_input(val_batch))
+                        val_losses.append(loss_dict['total_loss'])
+                print(f"  验证损失: {np.mean(val_losses):.4f}")
+                val_loss_dict = {'total_loss': np.mean(val_losses)}
             self.writer.add_scalar("Val/total_loss_epoch", val_loss_dict['total_loss'], epoch)
             # 更新学习率
             self._update_scheduler(val_loss_dict['total_loss'])
@@ -402,10 +317,6 @@ class regUNetTrainer:
                 param_group['lr'] = max(param_group['lr'], 1e-6)
             current_lr = self.optimizer.param_groups[0]['lr']
             print(f"  当前学习率: {current_lr:.6f}")
-            
-            # 保存检查点
-            if (epoch + 1) % 20 == 0:
-                self.save_checkpoint(epoch)
         
         print("\n训练完成！")
         print("=" * 60)
@@ -437,10 +348,10 @@ class regUNetTrainer:
     def test_forward(self):
         """测试前向传播"""
         print("\n测试前向传播...")
-        test_iter = iter(self.dataloaders['train'])
-        for i in range(1):
+        test_iter = iter(self.dataloaders['val'])
+        self.model.train()
+        for i in range(10):
             data = next(test_iter)
-            self.model.eval()
             with torch.no_grad():
                 output = self.model(self.set_input(data))
         

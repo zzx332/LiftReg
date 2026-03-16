@@ -15,11 +15,11 @@ class ResidualBlock(nn.Module):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, 
                                stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm3d(out_channels)
+        self.bn1 = nn.InstanceNorm3d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, 
                                stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm3d(out_channels)
+        self.bn2 = nn.InstanceNorm3d(out_channels)
         
         # Residual connection projection layer
         self.shortcut = nn.Sequential()
@@ -27,7 +27,7 @@ class ResidualBlock(nn.Module):
             self.shortcut = nn.Sequential(
                 nn.Conv3d(in_channels, out_channels, kernel_size=1, 
                          stride=stride, bias=False),
-                nn.BatchNorm3d(out_channels)
+                nn.InstanceNorm3d(out_channels)
             )
     
     def forward(self, x):
@@ -238,7 +238,7 @@ class model(nn.Module):
         model_output = {
             # "warped": warped_source,
             "warped_moving": warped_moving,
-            "phi": deform_field,
+            # "phi": deform_field,
             "params": disp_field,
             # "target": target_cp,
             "pca_coefs": coefs,

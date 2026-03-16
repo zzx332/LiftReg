@@ -1,1 +1,1 @@
-python custom_train.py -o "/data/zhouzhexin/ctdsa/exp_liftreg" -d "/home/zzx/data/extracted_data_shift_only1" -v "/home/zzx/data/data/test_shift_only1" -e "deepfluoro" -s "./" -g 0
+python custom_train.py -o "/home/zzx/data/exp_liftreg" -d "/home/zzx/data/extracted_data_shift_only1" -v "/home/zzx/data/data/test_shift_only1" -e "deepfluoro" -s "./" -g 0

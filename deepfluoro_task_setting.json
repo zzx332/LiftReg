@@ -1,10 +1,11 @@
 {
     "dataset": {
         "apply_hu_clip": true,
-        "data_path": "/home/zzx/data/test_0310",
-        "val_data_path": "/home/zzx/data/data/test_shift_only1",
+        "data_path": "/home/zzx/data/extracted_data_shift_only1",
+        "val_data_path": "/home/zzx/data/data/test_shift_only",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
+        "augmentation_enable": false,
         "img_after_resize": [
             160,
             160,
@@ -48,8 +49,8 @@
         "gpu_ids": 0,
         "loss": {
             "sim_factor": 1,
-            "initial_reg_factor": 0.001,
-            "min_reg_factor": 0.001,
+            "initial_reg_factor": 0.0005,
+            "min_reg_factor": 0.0005,
             "reg_factor_decay_from": 2,
             "sim_class": "liftreg.layers.losses.NCCLoss"
         },

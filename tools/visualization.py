@@ -24,8 +24,8 @@ def load_sample():
     option = setting["dataset"]
 
     dataset = FluoroDataset(
-        data_path=option["data_path"],
-        phase="train",
+        data_path=option["val_data_path"],
+        phase="val",
         option=option,
     )
     (sample, fname) = dataset[0]
@@ -58,7 +58,7 @@ def get_projection_for_backprojection(sample):
         proj = proj.unsqueeze(0)
     # proj_bp = proj.permute(0, 2, 1).flip(dims=[2])
     # proj_bp = proj.permute(0, 2, 1)
-    proj_bp = proj.flip(dims=[1])
+    proj_bp = proj.flip(dims=[1, 2])
     return proj_bp[0].detach().cpu().numpy()  # [H, W]
 
 def get_mask_projection_for_detector(dataset, sample):
@@ -73,7 +73,7 @@ def get_mask_projection_for_detector(dataset, sample):
     # mask_proj = mask_proj.squeeze(0).permute(0, 2, 1).flip(dims=[2])
     # mask_proj = mask_proj.squeeze(0).permute(0, 2, 1)
     # mask_proj = mask_proj.squeeze(0).permute(0, 2, 1)
-    mask_proj = mask_proj.squeeze(0).flip(dims=[1])
+    mask_proj = mask_proj.squeeze(0).flip(dims=[1, 2])
 
     # 先看第一个投影
     mask_proj_2d = mask_proj[0].detach().cpu().numpy()
@@ -135,8 +135,8 @@ def add_target_volume(plotter, sample, spacing):
     sx, sy, sz = spacing
 
     # PyVista 是 x,y,z；你的数组是 D,H,W，所以先转成 W,H,D
-    volume_xyz = np.transpose(target_volume, (2, 1, 0))
-    # volume_xyz = target_volume
+    # volume_xyz = np.transpose(target_volume, (2, 1, 0))
+    volume_xyz = target_volume
 
     grid = pv.ImageData()
     grid.dimensions = np.array(volume_xyz.shape) + 1  # 作为 cell_data
@@ -284,7 +284,7 @@ def main():
     mask_contour = detector.contour(isosurfaces=[0.5], scalars="mask")
     p.add_mesh(mask_contour, color="lime", line_width=3)
     # 射线示意
-    # add_detector_rays(p, S, O, U, V, proj_2d, stride=90)
+    add_detector_rays(p, S, O, U, V, proj_2d, stride=90)
     add_target_volume(p, sample, spacing)
     add_label_surface(p, sample)
     # # 反投影切片：体素 -> detector 落点
@@ -292,7 +292,8 @@ def main():
 
     # p.show()
     # output_dir = os.path.join("/data/zhouzhexin/ctdsa", "visualization")
-    output_dir = "/home/zzx/data/exp_liftreg/extracted_data_shift_only1/deepfluoro/2026_03_10_18_21_18/tests"
+    # output_dir = "/home/zzx/data/exp_liftreg/extracted_data_shift_only1/deepfluoro/2026_03_10_18_21_18/tests"
+    output_dir = "/home/zzx/data/data/test_shift_only"
     os.makedirs(output_dir, exist_ok=True)
 
     html_path = os.path.join(output_dir, f"{fname}_backprojection.html")

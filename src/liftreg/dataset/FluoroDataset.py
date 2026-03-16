@@ -184,7 +184,7 @@ class FluoroDataset(Dataset):
             target_poses, self.reorient[:3, :3], sdd=1020.0)
         # proj_for_bp = (torch.from_numpy(target_proj_np)
         #                .permute(0, 2, 1).flip(dims=[2]))
-        proj_for_bp = torch.from_numpy(target_proj_np).flip(dims=[1])
+        proj_for_bp = torch.from_numpy(target_proj_np).flip(dims=[1, 2])
         target_volume = self.backproject_volume(
             target_poses_SOUV, proj_for_bp, source_arr.shape,
             device=torch.device('cpu')).permute(2, 1, 0) # (X, Y, Z)
