@@ -386,7 +386,7 @@ class FluoroDataset(Dataset):
             # target_volume = self._augment_3d_intensity(target_volume)
             target_proj_aug, aug_tag = self._augment_2d_proj(target_proj)
             if aug_tag:
-                proj_for_bp = (torch.from_numpy(target_proj_aug).flip(dims=[1]))
+                proj_for_bp = (torch.from_numpy(target_proj_aug).flip(dims=[1, 2]))
                 target_volume_aug = self.backproject_volume(
                     meta['target_poses_SOUV'], proj_for_bp, source.shape,
                     device=torch.device('cpu'))
