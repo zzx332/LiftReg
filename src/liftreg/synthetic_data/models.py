@@ -14,6 +14,7 @@ def fit_polypose(
     poses,  # C-arm poses for X-rays
     volume,  # Preoperative CT
     mask,  # CT segmentation mask
+    output_dir,  # Output directory
     drr_kwargs,  # X-ray imaging parameters
     subject_id,  # Subject ID
 ):
@@ -32,7 +33,7 @@ def fit_polypose(
     drr.rescale_detector_(0.5)
     with torch.no_grad():
         model = PolyPose(drr, weights).cuda()
-        img, mask = model(poses, subject_id)
+        img, mask = model(poses, subject_id, output_dir)
 
     return img, mask
 

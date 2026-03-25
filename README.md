@@ -77,3 +77,8 @@ python main.py -o OUTPUT_FOLDER -d DATA_PATH -e disp_subspace -s ./ -g GPU_ID
 }
 
 ```
+
+## Data path
+1. training dataset path: ```/home/zzx/extracted_data_shift_only1```
+2. subject01 test datapath: ```/home/zzx/data/data/test_shift_only```
+3. subject06 test datapath: ```/home/zzx/data/data/test_shift_only1```

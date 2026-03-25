@@ -53,14 +53,14 @@ def save(subject_id, model_name, volume, model):
 def main():
     # Load the required data
     model_name = "polypose"
-    output_dir = rf'/home/zzx/extracted_data_shift_only1'
-    for subject_id in range(1, 7):
+    output_dir = rf'/home/zzx/extracted_data_shift_only3'
+    for subject_id in range(1, 6):
         volume, mask, xrays, _ = load_dataset(subject_id)
         frames = get_training_frames(subject_id)
         gt, poses = load_xrays(xrays, frames, output_dir, subject_id)
         # Run the registration
         if model_name == "polypose":
-            img, mask = fit_polypose(gt, poses, volume, mask, KWARGS, subject_id)
+            img, mask = fit_polypose(gt, poses, volume, mask, output_dir, KWARGS, subject_id)
         elif model_name == "densexyz":
             model = fit_densexyz(gt, poses, volume, mask, KWARGS)
         elif model_name == "densese3":

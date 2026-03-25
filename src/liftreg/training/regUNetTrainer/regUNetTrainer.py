@@ -349,7 +349,7 @@ class regUNetTrainer:
         """测试前向传播"""
         print("\n测试前向传播...")
         test_iter = iter(self.dataloaders['val'])
-        self.model.train()
+        self.model.eval()
         for i in range(10):
             data = next(test_iter)
             with torch.no_grad():
