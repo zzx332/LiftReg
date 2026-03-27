@@ -1,8 +1,8 @@
 {
     "dataset": {
         "apply_hu_clip": true,
-        "data_path": "/home/zzx/data/extracted_data_shift_only1",
-        "val_data_path": "/home/zzx/data/data/test_shift_only",
+        "data_path": "/home/zzx/data/extracted_data_shift_only3",
+        "val_data_path": "/home/zzx/data/data/test_shift_only1",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
         "augmentation_enable": false,
@@ -14,7 +14,7 @@
         "load_projection_interval": 1,
         "load_training_data_into_memory": true,
         "max_num_for_loading": [
-            100,
+            1000,
             20,
             10,
             10
@@ -37,8 +37,8 @@
                 false
             ],
             "workers": [
-                1,
-                1,
+                8,
+                4,
                 0,
                 0
             ]

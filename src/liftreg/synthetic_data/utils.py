@@ -6,11 +6,16 @@ from huggingface_hub import snapshot_download
 KWARGS = dict(
     labels=None,
     orientation="PA",
-    height=1436,
-    width=1436,
+    height=384,
+    width=384,
     sdd=1020.0,
-    delx=0.194,
-    dely=0.194,
+    delx=0.7255,
+    dely=0.7255,
+    # height=1436,
+    # width=1436,
+    # sdd=1020.0,
+    # delx=0.194,
+    # dely=0.194,
     x0=0.0,
     y0=0.0,
     reverse_x_axis=True,
@@ -38,7 +43,8 @@ def get_training_frames(subject_id):
     elif subject_id == 5:
         frames = [2, 47]
     elif subject_id == 6:
-        frames = [9, 7]
+        # frames = [9, 7]
+        frames = [16, 7]
     else:
         raise ValueError(f"subject_id must be in 1...6, now {subject_id}")
     return frames
