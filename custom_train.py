@@ -49,6 +49,7 @@ def prepare(args):
 
     setting_folder_path = args.setting_path
     # setting_path = os.path.join(setting_folder_path, 'cur_task_setting.json')
+    
     setting_path = os.path.join(setting_folder_path, 'deepfluoro_task_setting.json')
     assert os.path.isfile(setting_path), "Setting file is not found."
     setting = pars.ParameterDict()
@@ -139,7 +140,7 @@ if __name__ == '__main__':
         device='cuda' if torch.cuda.is_available() else 'cpu'
     )
     
-    # 测试前向传播
+    # 测试
     if args.test_forward:
         _ = trainer.test_forward()
         del _

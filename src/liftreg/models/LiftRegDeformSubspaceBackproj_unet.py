@@ -15,11 +15,13 @@ class ResidualBlock(nn.Module):
         super(ResidualBlock, self).__init__()
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size=3, 
                                stride=stride, padding=1, bias=False)
-        self.bn1 = nn.InstanceNorm3d(out_channels)
+        # self.bn1 = nn.InstanceNorm3d(out_channels)
+        self.bn1 = nn.BatchNorm3d(out_channels)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = nn.Conv3d(out_channels, out_channels, kernel_size=3, 
                                stride=1, padding=1, bias=False)
-        self.bn2 = nn.InstanceNorm3d(out_channels)
+        # self.bn2 = nn.InstanceNorm3d(out_channels)
+        self.bn2 = nn.BatchNorm3d(out_channels)
         
         # Residual connection projection layer
         self.shortcut = nn.Sequential()
@@ -27,7 +29,8 @@ class ResidualBlock(nn.Module):
             self.shortcut = nn.Sequential(
                 nn.Conv3d(in_channels, out_channels, kernel_size=1, 
                          stride=stride, bias=False),
-                nn.InstanceNorm3d(out_channels)
+                # nn.InstanceNorm3d(out_channels)
+                nn.BatchNorm3d(out_channels)
             )
     
     def forward(self, x):
@@ -229,10 +232,21 @@ class model(nn.Module):
         self._log_memory("model/after_deform_field")
         warped_moving = self.bilinear(density, deform_field)
         self._log_memory("model/after_warp")
-        warped_proj = self.renderer(warped_moving[0, 0], target_poses, affine_inverse).view(B,
-            -1,
-            self.detector.height,
-            self.detector.width)
+        # warped_proj = self.renderer(warped_moving[0, 0], target_poses, affine_inverse).view(B,
+        #     -1,
+        #     self.detector.height,
+        #     self.detector.width)
+        warped_projs = []
+        for b in range(B):
+            proj_b = self.renderer(
+                warped_moving[b, 0],           # (W, H, D) 单个 density
+                target_poses[b],               # 第 b 个样本的 pose
+                affine_inverse[b],             # 第 b 个样本的 affine inverse
+            )
+            warped_projs.append(proj_b)
+        warped_proj = torch.cat(warped_projs, dim=0).view(
+            B, -1, self.detector.height, self.detector.width
+        )
         self._log_memory("model/after_full_projection_render")
  
         model_output = {

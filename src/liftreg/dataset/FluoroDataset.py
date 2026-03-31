@@ -14,9 +14,83 @@ from torch.utils.data import Dataset
 from torchio import ScalarImage, LabelMap, Subject
 from diffdrr.detector import Detector
 from diffdrr.renderers import Siddon
-from diffdrr.pose import RigidTransform
+from diffdrr.pose import RigidTransform, convert
 from ..utils.sdct_projection_utils import backproj_grids_with_SOUV
 from polypose.weights import compute_weights
+
+class Warp(torch.nn.Module):
+    """Base class for all 3D deformation fields."""
+
+    def __init__(self, density, mask, weights, poses_rot, poses_xyz, affine):
+        super().__init__()
+
+        # Load the (possibly downsampled) volume and segmentation mask
+        self.density = torch.from_numpy(density).to(dtype=torch.float32).permute(2, 1, 0)[None, None]
+        self.mask = torch.from_numpy(mask).to(dtype=torch.uint8).permute(2, 1, 0)[None, None]
+        *_, self.W, self.H, self.D = self.density.shape
+
+        # Initialize identity points for sampling the displacement field
+        X, Y, Z = torch.meshgrid(
+            torch.arange(self.D),
+            torch.arange(self.H),
+            torch.arange(self.W),
+            indexing="ij",
+        )
+        self.pts = torch.stack([X, Y, Z], dim=-1).to(torch.float32)
+        
+        self.shape = torch.tensor([self.D, self.H, self.W])
+        self.weights = torch.from_numpy(weights).to(dtype=torch.float32)
+        self.weights = F.interpolate(
+            self.weights[None],
+            (self.D, self.H, self.W),
+            mode="trilinear",
+            align_corners=False,
+        )[0]
+        self.K, *_ = self.weights.shape
+        # Initialize the log transforms for the articulated structures in the volume
+        self.poses_rot = torch.nn.Parameter(poses_rot)
+        self.poses_xyz = torch.nn.Parameter(poses_xyz)
+        self.affine = RigidTransform(affine)
+        self.affine_inverse = RigidTransform(affine.inverse())
+
+    def normalize(self, x):
+        return 2 * x / self.shape - 1
+    
+    @property
+    def pose(self) -> RigidTransform:
+        """Compute the average log transform at every point in space and map to the manifold."""
+        poses = torch.concat([self.poses_rot, self.poses_xyz], dim=-1)
+        logs = torch.einsum("cdhw,cn->dhwn", self.weights, poses).reshape(-1, 6)
+        pose = convert(*logs.split([3, 3], dim=1), parameterization="se3_log_map")
+        return self.affine.compose(pose).compose(self.affine_inverse)
+
+    def warp(self):
+        """Sample the displacement field at the identity points."""
+        x = self.pts.reshape(-1, 1, 3)
+        x = self.pose(x)
+        return x.reshape(1, self.D, self.H, self.W, 3)
+
+    def forward(self):
+        warped_coords = self.warp()
+        original_coords = self.pts
+        displacement = warped_coords[0] - original_coords
+        pts = self.normalize(warped_coords)
+        warped_density = self._warp_volume(self.density, pts)
+        warped_mask = self._warp_mask(self.mask, pts)
+        return warped_density, warped_mask, displacement
+
+
+    def _warp_volume(self, volume, pts):
+        dtype = volume.dtype
+        if volume.dtype != pts.dtype:
+            volume = volume.to(pts.dtype)
+        return F.grid_sample(volume, pts, align_corners=False, mode="bilinear", padding_mode="border").squeeze().to(dtype)
+
+    def _warp_mask(self, mask, pts):
+        dtype = mask.dtype
+        if mask.dtype != pts.dtype:
+            mask = mask.to(pts.dtype)
+        return F.grid_sample(mask, pts, align_corners=False, mode="nearest").squeeze().to(dtype)
 
 class FluoroDataset(Dataset):
     """
@@ -30,9 +104,12 @@ class FluoroDataset(Dataset):
     """
 
     def __init__(self, data_path, phase=None, transform=None, option=None):
-        self.data_path = "/home/zzx/data/deepfluoro"
-        self.drr_path  = os.path.join(data_path, "drr")
-        self.cache_dir = os.path.join(data_path, "preprocessed")
+        self.data_path = data_path
+        self.org_data_path = "/home/zzx/data/deepfluoro"
+        self.drr_path  = os.path.join(self.data_path, "drr")
+        self.cache_dir = os.path.join(self.data_path, "preprocessed")
+        self.warp_path = os.path.join(self.data_path, "warp_pose")
+
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self.phase     = phase
@@ -58,7 +135,13 @@ class FluoroDataset(Dataset):
         self.aug_brightness_prob = option[('aug_brightness_prob', 0.5, '')]
         self.aug_noise_prob      = option[('aug_noise_prob',      0.5, '')]
         self.aug_lr_flip_prob    = option[('aug_lr_flip_prob',    0.5, '')]
+        self.aug_affine_prob     = option[('aug_affine_prob',     0.3, '')]
+        self.aug_rotate_deg      = option[('aug_rotate_deg',      5.0, '')]
+        self.aug_translate_vox   = option[('aug_translate_vox',   4.0, '')]
+        self.aug_scale_range     = option[('aug_scale_range',     (0.95, 1.05), '')]
         # self.aug_proj_mask_prob  = option[('aug_proj_mask_prob',  0.3, '')]
+        self.detector_spacing = option[('detector_spacing', 0.7255, '')]
+        self.detector_width = option[('detector_width', 384, '')]
 
         self.reorient = torch.tensor(
             [[1, 0, 0, 0],
@@ -90,7 +173,8 @@ class FluoroDataset(Dataset):
             self._siddon = Siddon(voxel_shift=0.0)
         if not hasattr(self, '_detector') or self._detector is None:
             self._detector = Detector(
-                1020.0, 718, 718, 0.388, 0.388, 0, 0,
+                # 1020.0, 718, 718, 0.388, 0.388, 0, 0,
+                1020.0, self.detector_width, self.detector_width, self.detector_spacing, self.detector_spacing, 0, 0,
                 self.reorient, reverse_x_axis=True, n_subsample=None,
             )
 
@@ -106,7 +190,7 @@ class FluoroDataset(Dataset):
 
     def _load_dataset(self, subject_id, dataset="deepfluoro"):
         # datapath = Path(rf"/home/zzx/data/deepfluoro/subject{subject_id:02d}")
-        datapath = Path(os.path.join(self.data_path, subject_id))
+        datapath = Path(os.path.join(self.org_data_path, subject_id))
 
         # Make paths to the relevant images
         volume = datapath / "volume.nii.gz"
@@ -134,9 +218,10 @@ class FluoroDataset(Dataset):
         #     os.path.join(self.data_path,
         #                  identifier.split('_')[0] + '_source.nii.gz'))
         source_img = ScalarImage(volume) # X, Y, Z
-        source_seg = ScalarImage(mask)
+        # source_seg = ScalarImage(mask)
+        source_seg = LabelMap(mask)
         source_img = self.canonicalize(source_img)
-        source_seg = self.canonicalize(source_seg)
+        source_seg = self.canonicalize(source_seg, is_label=True)
         # subject = self.canonicalize(subject)
         subject = Subject(volume=source_img, mask=source_seg)
         _, weights = compute_weights(subject, labels=[[1, 2, 3, 4, 7], [5], [6]])
@@ -148,7 +233,6 @@ class FluoroDataset(Dataset):
         source_img = tfm(source_img)
         if self.has_label and source_seg is not None:
             source_seg = tfm(source_seg)
-
 
         source_arr = source_img.data.squeeze(0).numpy().astype(np.float32)
         if self.apply_hu_clip:
@@ -169,14 +253,9 @@ class FluoroDataset(Dataset):
                          identifier.split('_')[0] + '_pose.pt'),
             weights_only=False)['pose'][::self.load_projection_interval]
         # render要求的输入图像是xyz顺序
-        # target_proj_t = self._run_renderer(
-        #     density_t.squeeze(0), target_poses, affine.inverse())
         target_proj_t = sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(self.drr_path,
                          identifier + '.nii.gz')))
         target_proj_t = np.transpose(target_proj_t, (0, 2, 1))  # 把 proj变成hw顺序            
-        # (1, P, H, W) → squeeze batch → (P, H, W)
-        # target_proj_np = (target_proj_t.squeeze(0)
-                        #   .detach().cpu().numpy().astype(np.float32))
         target_proj_np = target_proj_t.astype(np.float32)
 
         # ---- 3. Back-project 2D → 3D volume ----
@@ -321,6 +400,189 @@ class FluoroDataset(Dataset):
 
         return proj.astype(np.float32), aug_tag  # 已由上面的 clip 保证在原始值域内
 
+    def _resolve_axis_ranges(self, value, symmetric=False):
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 0:
+            bound = float(arr)
+            pair = (-bound, bound) if symmetric else (bound, bound)
+            return [pair, pair, pair]
+        if arr.size == 2:
+            pair = (float(arr[0]), float(arr[1]))
+            return [pair, pair, pair]
+        if arr.size == 3:
+            return [
+                (-float(v), float(v)) if symmetric else (float(v), float(v))
+                for v in arr.tolist()
+            ]
+        if arr.size == 6:
+            return [
+                (float(arr[0]), float(arr[1])),
+                (float(arr[2]), float(arr[3])),
+                (float(arr[4]), float(arr[5])),
+            ]
+        raise ValueError(f'Unsupported axis range config: {value}')
+
+    def _resolve_scale_range(self, value):
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.ndim == 0:
+            delta = float(arr)
+            return 1.0 - delta, 1.0 + delta
+        if arr.size == 2:
+            return float(arr[0]), float(arr[1])
+        raise ValueError(f'Unsupported scale range config: {value}')
+
+    def _normalized_to_voxel_h(self, vol_shape):
+        D, H, W = [int(x) for x in vol_shape]
+        mat = torch.eye(4, dtype=torch.float32)
+        if W > 1:
+            mat[0, 0] = (W - 1) / 2.0
+            mat[0, 3] = (W - 1) / 2.0
+        else:
+            mat[0, 0] = 0.0
+            mat[0, 3] = 0.0
+        if H > 1:
+            mat[1, 1] = (H - 1) / 2.0
+            mat[1, 3] = (H - 1) / 2.0
+        else:
+            mat[1, 1] = 0.0
+            mat[1, 3] = 0.0
+        if D > 1:
+            mat[2, 2] = (D - 1) / 2.0
+            mat[2, 3] = (D - 1) / 2.0
+        else:
+            mat[2, 2] = 0.0
+            mat[2, 3] = 0.0
+        return mat
+
+    def _voxel_to_normalized_h(self, vol_shape):
+        D, H, W = [int(x) for x in vol_shape]
+        mat = torch.eye(4, dtype=torch.float32)
+        if W > 1:
+            mat[0, 0] = 2.0 / (W - 1)
+            mat[0, 3] = -1.0
+        else:
+            mat[0, 0] = 0.0
+            mat[0, 3] = 0.0
+        if H > 1:
+            mat[1, 1] = 2.0 / (H - 1)
+            mat[1, 3] = -1.0
+        else:
+            mat[1, 1] = 0.0
+            mat[1, 3] = 0.0
+        if D > 1:
+            mat[2, 2] = 2.0 / (D - 1)
+            mat[2, 3] = -1.0
+        else:
+            mat[2, 2] = 0.0
+            mat[2, 3] = 0.0
+        return mat
+
+    def _build_shared_affine(self, vol_shape):
+        if np.random.rand() >= self.aug_affine_prob:
+            return None, None
+
+        rotate_ranges = self._resolve_axis_ranges(self.aug_rotate_deg, symmetric=True)
+        translate_ranges = self._resolve_axis_ranges(self.aug_translate_vox, symmetric=True)
+        scale_min, scale_max = self._resolve_scale_range(self.aug_scale_range)
+
+        rx, ry, rz = [
+            np.deg2rad(np.random.uniform(lo, hi)) for lo, hi in rotate_ranges
+        ]
+        tx, ty, tz = [
+            np.random.uniform(lo, hi) for lo, hi in translate_ranges
+        ]
+        scale = float(np.random.uniform(scale_min, scale_max))
+
+        cx = (vol_shape[2] - 1) / 2.0
+        cy = (vol_shape[1] - 1) / 2.0
+        cz = (vol_shape[0] - 1) / 2.0
+
+        translate_to_center = np.eye(4, dtype=np.float32)
+        translate_to_center[:3, 3] = np.array([-cx, -cy, -cz], dtype=np.float32)
+        translate_back = np.eye(4, dtype=np.float32)
+        translate_back[:3, 3] = np.array([cx, cy, cz], dtype=np.float32)
+        shift = np.eye(4, dtype=np.float32)
+        shift[:3, 3] = np.array([tx, ty, tz], dtype=np.float32)
+        scale_mat = np.diag([scale, scale, scale, 1.0]).astype(np.float32)
+
+        cosx, sinx = np.cos(rx), np.sin(rx)
+        cosy, siny = np.cos(ry), np.sin(ry)
+        cosz, sinz = np.cos(rz), np.sin(rz)
+
+        rot_x = np.array([
+            [1.0, 0.0,  0.0,   0.0],
+            [0.0, cosx, -sinx, 0.0],
+            [0.0, sinx, cosx,  0.0],
+            [0.0, 0.0,  0.0,   1.0],
+        ], dtype=np.float32)
+        rot_y = np.array([
+            [cosy,  0.0, siny, 0.0],
+            [0.0,   1.0, 0.0,  0.0],
+            [-siny, 0.0, cosy, 0.0],
+            [0.0,   0.0, 0.0,  1.0],
+        ], dtype=np.float32)
+        rot_z = np.array([
+            [cosz, -sinz, 0.0, 0.0],
+            [sinz, cosz,  0.0, 0.0],
+            [0.0,  0.0,   1.0, 0.0],
+            [0.0,  0.0,   0.0, 1.0],
+        ], dtype=np.float32)
+
+        forward = shift @ translate_back @ rot_z @ rot_y @ rot_x @ scale_mat @ translate_to_center
+        voxel_to_input = torch.from_numpy(np.linalg.inv(forward).astype(np.float32))
+        theta_h = (
+            self._voxel_to_normalized_h(vol_shape)
+            @ voxel_to_input
+            @ self._normalized_to_voxel_h(vol_shape)
+        )
+        theta = theta_h[:3, :].unsqueeze(0)
+        grid = F.affine_grid(
+            theta,
+            size=(1, 1, int(vol_shape[0]), int(vol_shape[1]), int(vol_shape[2])),
+            align_corners=True,
+        )
+        return grid, voxel_to_input
+
+    def _apply_affine_grid(self, arr, grid, mode='bilinear', padding_mode='border'):
+        if arr.ndim == 3:
+            tensor = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)
+        elif arr.ndim == 4:
+            tensor = torch.from_numpy(arr).unsqueeze(0)
+        else:
+            raise ValueError(f'Expected 3D or 4D array, got shape {arr.shape}')
+        sampled = F.grid_sample(
+            tensor.to(dtype=torch.float32),
+            grid,
+            mode=mode,
+            padding_mode=padding_mode,
+            align_corners=True,
+        )
+        sampled = sampled.squeeze(0).cpu().numpy().astype(np.float32)
+        return sampled[0] if arr.ndim == 3 else sampled
+
+    def _apply_shared_affine_3d(self, source, density, source_seg, weights, affine):
+        grid, voxel_to_input = self._build_shared_affine(source.shape)
+        if grid is None:
+            return source, density, source_seg, weights, affine, None
+
+        stacked = np.stack([source, density], axis=0)
+        stacked = self._apply_affine_grid(
+            stacked, grid, mode='bilinear', padding_mode='border')
+        source_aug, density_aug = stacked[0], stacked[1]
+
+        source_seg_aug = source_seg
+        if source_seg is not None:
+            source_seg_aug = self._apply_affine_grid(
+                source_seg, grid, mode='nearest', padding_mode='zeros')
+
+        weights_aug = weights
+        if weights is not None:
+            weights_aug = self._apply_affine_grid(
+                weights, grid, mode='nearest', padding_mode='zeros')
+
+        new_affine = affine @ voxel_to_input
+        return source_aug, density_aug, source_seg_aug, weights_aug, new_affine, grid
+
     def _apply_lr_flip(self, source, density, source_seg, weights,
                        target_proj, target_volume, affine):
         """
@@ -361,42 +623,66 @@ class FluoroDataset(Dataset):
 
         # ---- Load preprocessed arrays from disk (fast np.load) ----
         npz           = np.load(os.path.join(self.cache_dir, f'{identifier}.npz'))
-        source        = npz['source'].astype(np.float32)         # (D, H, W)
-        density       = npz['density'].astype(np.float32)        # (D, H, W)
-        target_proj   = npz['target_proj'].astype(np.float32)    # (P, H, W)
-        target_volume = npz['target_volume'].astype(np.float32)  # (D, H, W)
-        spacing       = npz['spacing']
-        source_seg    = (npz['source_seg'].astype(np.float32)
+        source        = np.ascontiguousarray(npz['source'].astype(np.float32))         # (D, H, W)
+        density       = np.ascontiguousarray(npz['density'].astype(np.float32))        # (D, H, W)
+        target_proj   = np.ascontiguousarray(npz['target_proj'].astype(np.float32))    # (P, H, W)
+        target_volume = np.ascontiguousarray(npz['target_volume'].astype(np.float32))  # (D, H, W)
+        spacing       = np.ascontiguousarray(npz['spacing'].astype(np.float32))
+        source_seg    = (np.ascontiguousarray(npz['source_seg'].astype(np.float32))
                          if self.has_label else None)
-        weights       = (npz['weights'].astype(np.float32)
+        weights       = (np.ascontiguousarray(npz['weights'].astype(np.float32))
                          if self.has_label else None)
-        affine        = meta['affine'].clone()
         affine        = meta['affine'].clone()
 
         # ---- Online augmentation (train phase only) ----
         if self.enable_aug:
+            affine_grid = None
             # if np.random.rand() < self.aug_lr_flip_prob:
             #     (source, density, source_seg, weights,
             #      target_proj, target_volume, affine) = self._apply_lr_flip(
             #         source, density, source_seg, weights,
             #         target_proj, target_volume, affine)
+            (source, density, source_seg, weights,
+             affine, affine_grid) = self._apply_shared_affine_3d(
+                source, density, source_seg, weights, affine)
 
-            source_aug        = self._augment_3d_intensity(source)
-            # density       = self._augment_3d_intensity(density)
-            # target_volume = self._augment_3d_intensity(target_volume)
-            target_proj_aug, aug_tag = self._augment_2d_proj(target_proj)
+            # source_aug        = self._augment_3d_intensity(source)
+            poses_rot = torch.load(os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt'), weights_only=True, map_location="cpu")
+            poses_xyz = torch.load(os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_xyz_")}.pt'), weights_only=True, map_location="cpu")
+            warp = Warp(density, source_seg, weights, poses_rot, poses_xyz, affine)
+            warped_density, warped_mask, displacement = warp()
+            self._init_projector_if_needed()
+            target_proj_aug = self._run_renderer(
+                warped_density, meta['target_poses'], affine.inverse())[0].detach().cpu().numpy()
+            source_aug = source
+            # target_proj_aug, aug_tag = self._augment_2d_proj(target_proj)
+            aug_tag = True
             if aug_tag:
                 proj_for_bp = (torch.from_numpy(target_proj_aug).flip(dims=[1, 2]))
                 target_volume_aug = self.backproject_volume(
                     meta['target_poses_SOUV'], proj_for_bp, source.shape,
-                    device=torch.device('cpu'))
+                    device=torch.device('cpu')).cpu().numpy()
                 target_volume_aug = np.transpose(target_volume_aug, (2, 1, 0))
             else:
                 target_volume_aug = target_volume
+            if affine_grid is not None:
+                target_volume_aug = self._apply_affine_grid(
+                    target_volume_aug, affine_grid,
+                    mode='bilinear', padding_mode='border')
         else:
             source_aug = source
             target_volume_aug = target_volume
             target_proj_aug = target_proj
+
+        # Ensure numpy buffers are contiguous/writable for DataLoader collation.
+        source_aug = np.ascontiguousarray(source_aug.astype(np.float32))
+        density = np.ascontiguousarray(density.astype(np.float32))
+        target_volume_aug = np.ascontiguousarray(target_volume_aug.astype(np.float32))
+        target_proj_aug = np.ascontiguousarray(target_proj_aug.astype(np.float32))
+        if source_seg is not None:
+            source_seg = np.ascontiguousarray(source_seg.astype(np.float32))
+        if weights is not None:
+            weights = np.ascontiguousarray(weights.astype(np.float32))
         # ---- Build sample dict (add channel dim to 3D volumes) ----
         sample = {
             'source':            np.expand_dims(source_aug,        0),  # (1,D,H,W)
@@ -410,7 +696,7 @@ class FluoroDataset(Dataset):
         }
         if self.has_label and source_seg is not None:
             sample['source_label'] = np.expand_dims(source_seg, 0)  # (1,D,H,W)
-            sample['weights'] = np.expand_dims(weights, 0)  # (1,D,H,W)
+            # sample['weights'] = np.expand_dims(weights, 0)  # (1,D,H,W)
 
         if self.transform:
             sample['source'] = self.transform(sample['source'])
@@ -444,7 +730,8 @@ class FluoroDataset(Dataset):
             source_arr_shape,
             S.unsqueeze(0), O.unsqueeze(0), U.unsqueeze(0), V.unsqueeze(0),
             target_proj.shape[2], target_proj.shape[1],
-            du=0.388, dv=0.388,
+            # du=0.388, dv=0.388,
+            du=self.detector_spacing, dv=self.detector_spacing,
             cu=(target_proj.shape[2] - 1) / 2.0,
             cv=(target_proj.shape[1] - 1) / 2.0,
             device=device,
@@ -460,27 +747,19 @@ class FluoroDataset(Dataset):
         vol  = flat.reshape(*source_arr_shape)
         return self._normalize_intensity(vol)
 
-    def canonicalize(self, volume):
+    def canonicalize(self, volume, is_label=False):
+        """Move the Subject's isocenter to the origin in world coordinates"""
         isocenter = volume.get_center()
         Tinv = np.array([
             [1, 0, 0, -isocenter[0]],
             [0, 1, 0, -isocenter[1]],
             [0, 0, 1, -isocenter[2]],
             [0, 0, 0,  1           ]], dtype=np.float64)
-        return ScalarImage(tensor=volume.data, affine=Tinv.dot(volume.affine))
-        # Move the Subject's isocenter to the origin in world coordinates
-        # for image in subject.get_images(intensity_only=False):
-        #     isocenter = image.get_center()
-        #     Tinv = np.array(
-        #         [
-        #             [1.0, 0.0, 0.0, -isocenter[0]],
-        #             [0.0, 1.0, 0.0, -isocenter[1]],
-        #             [0.0, 0.0, 1.0, -isocenter[2]],
-        #             [0.0, 0.0, 0.0, 1.0],
-        #         ]
-        #     )
-        #     image.affine = Tinv.dot(image.affine)
-        # return subject
+        # return ScalarImage(tensor=volume.data, affine=)
+        if is_label:
+            return LabelMap(tensor=volume.data, affine=Tinv.dot(volume.affine))
+        else:
+            return ScalarImage(tensor=volume.data, affine=Tinv.dot(volume.affine))
 
     def _extrinsic_cam2world_to_SOUV(self, extrinsic, reorient, sdd, device=None):
         R = extrinsic[:3, :3]

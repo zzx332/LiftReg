@@ -8,7 +8,7 @@
         "img_after_resize": [160, 160],
         "load_projection_interval": 1,
         "load_training_data_into_memory": true,
-        "max_num_for_loading": [100, 20, 10, 10],
+        "max_num_for_loading": [1000, 20, 10, 10],
         "spacing_to_refer": [2.2, 2.2, 2.2],
         "use_segmentation_map": true,
         "augmentation_enable": false,
@@ -28,7 +28,8 @@
         "loss": {
             "sim_factor": 1.0,
             "reg_factor": 1.0,
-            "use_dice": false
+            "use_dice": false,
+            "sim_class": "liftreg.layers.losses.NCCLoss"
         },
         "loss_class": "liftreg.losses.RegLoss2D.loss",
         "mode": "train",

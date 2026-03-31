@@ -13,6 +13,17 @@ from liftreg.utils.general import make_dir, get_class
 from liftreg.utils import module_parameters as pars
 from liftreg.utils.utils import set_seed_for_demo
 
+class ExportWrapper(torch.nn.Module):
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+    def forward(self, source_proj, target_proj):
+        out = self.net({
+            "source_proj": source_proj,
+            "target_proj": target_proj,
+        })
+        return out["phi"], out["warped_moving"], out["target_proj"]  # 固定tuple输出
+
 class RegTrainer2D:
     def __init__(self, setting, device='cuda'):
         self.setting = setting
@@ -60,6 +71,17 @@ class RegTrainer2D:
             else:
                 ret[k] = v
         return ret
+
+    def export_pt(self, output_path):
+        self.model.eval().to(self.device)
+        wrapper = ExportWrapper(self.model).eval().to(self.device)
+        src = torch.rand(1, 1, 160, 160, device=self.device)
+        tgt = torch.rand(1, 1, 160, 160, device=self.device)
+        traced = torch.jit.trace(wrapper, (src, tgt), strict=True)
+        traced.save(os.path.join(output_path, "model.pt"))
+        print("saved:", os.path.join(output_path, "model.pt"))
+        print(D)
+        return
 
     def train(self):
         print(f"Starting 2D Training for {self.epochs} epochs.")
@@ -147,6 +169,7 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--setting_path', required=True, type=str, help='Path to deepfluoro_task_setting_2d.json')
     parser.add_argument('-e', '--exp_name', required=False, type=str, default="exp_2d")
     parser.add_argument('--continue_from', required=False, type=str, default=None, help='Path to checkpoint for continue training')
+    parser.add_argument('--test', action='store_true', help='Test the model')
     args = parser.parse_args()
 
     set_seed_for_demo()
@@ -165,5 +188,12 @@ if __name__ == '__main__':
     make_dir(os.path.join(exp_path, "checkpoints"))
 
     trainer = RegTrainer2D(setting=setting)
-    # trainer.validate(0)
+    # trainer.export_pt(exp_path)
+    # 测试前向传播
+    if args.test:
+        _ = trainer.validate(0)
+        del _
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     trainer.train()

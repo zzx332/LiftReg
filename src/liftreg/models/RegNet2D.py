@@ -29,7 +29,8 @@ class SpatialTransformer(nn.Module):
         # Move channels dim to last position
         if len(shape) == 2:
             new_locs = new_locs.permute(0, 2, 3, 1)
-            new_locs = new_locs[..., [1, 0]]  # x, y format for grid_sample
+            # new_locs = new_locs[..., [1, 0]]  # x, y format for grid_sample
+            new_locs = torch.stack((new_locs[..., 1], new_locs[..., 0]), dim=-1)
 
         return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
 
@@ -38,11 +39,14 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.gn = nn.GroupNorm(8, out_channels)
+        # self.gn = nn.GroupNorm(8, out_channels)
+        # self.bn = nn.BatchNorm2d(out_channels)
+        self.in_norm = nn.InstanceNorm2d(out_channels)
         self.lrelu = nn.LeakyReLU(0.2)
         
     def forward(self, x):
-        return self.lrelu(self.gn(self.conv(x)))
+        # return self.lrelu(self.gn(self.conv(x)))
+        return self.lrelu(self.in_norm(self.conv(x)))
 
 
 class RegNet2D(nn.Module):
