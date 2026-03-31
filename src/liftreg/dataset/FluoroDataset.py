@@ -109,7 +109,8 @@ class FluoroDataset(Dataset):
         self.drr_path  = os.path.join(self.data_path, "drr")
         self.cache_dir = os.path.join(self.data_path, "preprocessed")
         self.warp_path = os.path.join(self.data_path, "warp_pose")
-
+        self.warp_pose_cache = {}
+        
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self.phase     = phase
@@ -150,8 +151,7 @@ class FluoroDataset(Dataset):
              [0, 0, 0, 1]], dtype=torch.float32)
 
         # meta_list holds lightweight per-sample dicts (poses, affine)
-        self.meta_list = []
-
+        self.meta_cache = {}
         self.get_identifier_list()
         self.init_img_pool()
 
@@ -303,7 +303,13 @@ class FluoroDataset(Dataset):
             meta = torch.load(
                 os.path.join(self.cache_dir, f'{identifier}_meta.pt'),
                 weights_only=False)
-            self.meta_list.append(meta)
+            self.meta_cache[identifier] = {"meta": meta}
+            rot_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt')
+            xyz_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_xyz_")}.pt')
+            self.warp_pose_cache[identifier] = {
+                "poses_rot": torch.load(rot_path, map_location="cpu", weights_only=True),
+                "poses_xyz": torch.load(xyz_path, map_location="cpu", weights_only=True),
+            }
             pbar.update(i + 1)
 
         pbar.finish()
@@ -619,8 +625,10 @@ class FluoroDataset(Dataset):
     def __getitem__(self, idx):
         idx        = idx % len(self.identifier_list)
         identifier = self.identifier_list[idx]
-        meta       = self.meta_list[idx]
-
+        meta       = self.meta_cache[identifier]["meta"]
+        cache = self.warp_pose_cache[identifier]
+        poses_rot = cache["poses_rot"]
+        poses_xyz = cache["poses_xyz"]
         # ---- Load preprocessed arrays from disk (fast np.load) ----
         npz           = np.load(os.path.join(self.cache_dir, f'{identifier}.npz'))
         source        = np.ascontiguousarray(npz['source'].astype(np.float32))         # (D, H, W)
@@ -642,33 +650,29 @@ class FluoroDataset(Dataset):
             #      target_proj, target_volume, affine) = self._apply_lr_flip(
             #         source, density, source_seg, weights,
             #         target_proj, target_volume, affine)
-            (source, density, source_seg, weights,
+            (source_aug, density, source_seg, weights,
              affine, affine_grid) = self._apply_shared_affine_3d(
                 source, density, source_seg, weights, affine)
 
             # source_aug        = self._augment_3d_intensity(source)
-            poses_rot = torch.load(os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt'), weights_only=True, map_location="cpu")
-            poses_xyz = torch.load(os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_xyz_")}.pt'), weights_only=True, map_location="cpu")
-            warp = Warp(density, source_seg, weights, poses_rot, poses_xyz, affine)
-            warped_density, warped_mask, displacement = warp()
-            self._init_projector_if_needed()
-            target_proj_aug = self._run_renderer(
-                warped_density, meta['target_poses'], affine.inverse())[0].detach().cpu().numpy()
-            source_aug = source
             # target_proj_aug, aug_tag = self._augment_2d_proj(target_proj)
-            aug_tag = True
-            if aug_tag:
+            if affine_grid is not None:
+                warp = Warp(density, source_seg, weights, poses_rot, poses_xyz, affine)
+                warped_density, warped_mask, displacement = warp()
+                self._init_projector_if_needed()
+                target_proj_aug = self._run_renderer(
+                    warped_density, meta['target_poses'], affine.inverse())[0].detach().cpu().numpy()
                 proj_for_bp = (torch.from_numpy(target_proj_aug).flip(dims=[1, 2]))
                 target_volume_aug = self.backproject_volume(
-                    meta['target_poses_SOUV'], proj_for_bp, source.shape,
+                    meta['target_poses_SOUV'], proj_for_bp, source_aug.shape,
                     device=torch.device('cpu')).cpu().numpy()
                 target_volume_aug = np.transpose(target_volume_aug, (2, 1, 0))
-            else:
-                target_volume_aug = target_volume
-            if affine_grid is not None:
                 target_volume_aug = self._apply_affine_grid(
                     target_volume_aug, affine_grid,
                     mode='bilinear', padding_mode='border')
+            else:
+                target_volume_aug = target_volume
+                target_proj_aug = target_proj
         else:
             source_aug = source
             target_volume_aug = target_volume

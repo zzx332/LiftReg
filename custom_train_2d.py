@@ -88,7 +88,7 @@ class RegTrainer2D:
         for epoch in range(self.start_epoch, self.epochs + 1):
             self.model.train()
             epoch_loss = 0.0
-            sim_loss_epoch = 0.0
+            sim_loss_epoch = 0.05
             reg_loss_epoch = 0.0
             
             pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.epochs}")

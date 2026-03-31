@@ -11,8 +11,14 @@
         "max_num_for_loading": [1000, 20, 10, 10],
         "spacing_to_refer": [2.2, 2.2, 2.2],
         "use_segmentation_map": true,
-        "augmentation_enable": false,
-        "aug_noise_prob": 0.5
+        "augmentation_enable": true,
+        "aug_noise_prob": 0.5,
+        "aug_affine_prob": 0.3,
+        "aug_rotate_deg": 2.0,
+        "aug_translate_vox": 4.0,
+        "aug_scale_range": [0.95, 1.05],
+        "detector_spacing": 0.7255,
+        "detector_width": 384
     },
     "train": {
         "check_best_model_frequency": 1,

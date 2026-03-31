@@ -40,13 +40,13 @@ class ConvBlock(nn.Module):
         super().__init__()
         self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
         # self.gn = nn.GroupNorm(8, out_channels)
-        # self.bn = nn.BatchNorm2d(out_channels)
-        self.in_norm = nn.InstanceNorm2d(out_channels)
+        self.bn = nn.BatchNorm2d(out_channels)
+        # self.in_norm = nn.InstanceNorm2d(out_channels)
         self.lrelu = nn.LeakyReLU(0.2)
         
     def forward(self, x):
         # return self.lrelu(self.gn(self.conv(x)))
-        return self.lrelu(self.in_norm(self.conv(x)))
+        return self.lrelu(self.bn(self.conv(x)))
 
 
 class RegNet2D(nn.Module):
