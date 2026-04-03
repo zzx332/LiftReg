@@ -12,6 +12,7 @@
         "spacing_to_refer": [2.2, 2.2, 2.2],
         "use_segmentation_map": true,
         "augmentation_enable": true,
+        "offline_aug_variants": 4,
         "aug_noise_prob": 0.5,
         "aug_affine_prob": 0.3,
         "aug_rotate_deg": 2.0,
@@ -25,7 +26,7 @@
         "dataloader": {
             "batch_size": 2,
             "shuffle": [true, true, false, false],
-            "workers": [4, 4, 0, 0]
+            "workers": [1, 1, 0, 0]
         },
         "debug_on": true,
         "memory_profile": true,
@@ -35,7 +36,7 @@
             "sim_factor": 1.0,
             "reg_factor": 1.0,
             "use_dice": false,
-            "sim_class": "liftreg.layers.losses.NCCLoss"
+            "sim_class": "liftreg.layers.losses.NCC2D"
         },
         "loss_class": "liftreg.losses.RegLoss2D.loss",
         "mode": "train",

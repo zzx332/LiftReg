@@ -7,7 +7,7 @@ from tqdm import tqdm
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import argparse
-
+from stat import S_IREAD
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 from liftreg.utils.general import make_dir, get_class
 from liftreg.utils import module_parameters as pars
@@ -133,18 +133,31 @@ class RegTrainer2D:
                 }, save_path)
                 print(f"Checkpoint saved to {save_path}")
 
-    def validate(self, epoch):
+    def validate(self, epoch, save_path=None):
         self.model.eval()
         val_loss = 0.0
         with torch.no_grad():
-            for batch, _ in self.val_loader:
+            for batch, identifier in self.val_loader:
                 batch = self.set_input(batch)
                 output = self.model(batch)
+                if save_path is not None:
+                    self.save_output(batch, output, save_path, identifier)
+                    continue
                 losses = self.loss(output)
                 val_loss += losses['total_loss'].item()
         avg_val_loss = val_loss / len(self.val_loader)
         self.writer.add_scalar("Val/Total_Loss", avg_val_loss, epoch)
         print(f"Validation Loss: {avg_val_loss:.4f}")
+    
+    def save_output(self, input, output, save_path, identifier):
+        make_dir(os.path.dirname(save_path))
+        import SimpleITK as sitk
+        def save_tensor_arr(tensor_arr, path):
+            sitk.WriteImage(sitk.GetImageFromArray(tensor_arr[:,0].detach().cpu().numpy()), path)
+        save_name = f"{identifier[0]}_{identifier[1].split('.')[0][-2:]}"
+        save_tensor_arr(input['source_proj'], os.path.join(save_path, f"{save_name}_moving.nii.gz"))
+        save_tensor_arr(output['target_proj'], os.path.join(save_path, f"{save_name}_fixed.nii.gz"))
+        save_tensor_arr(output['warped_moving'], os.path.join(save_path, f"{save_name}_warped.nii.gz"))
 
     def _load_checkpoint(self, ckpt_path):
         if not os.path.isfile(ckpt_path):
@@ -169,6 +182,7 @@ if __name__ == '__main__':
     parser.add_argument('-s', '--setting_path', required=True, type=str, help='Path to deepfluoro_task_setting_2d.json')
     parser.add_argument('-e', '--exp_name', required=False, type=str, default="exp_2d")
     parser.add_argument('--continue_from', required=False, type=str, default=None, help='Path to checkpoint for continue training')
+    parser.add_argument('--save_path', required=False, type=str, default=None, help='Path to save the output')
     parser.add_argument('--test', action='store_true', help='Test the model')
     args = parser.parse_args()
 
@@ -186,14 +200,18 @@ if __name__ == '__main__':
     make_dir(exp_path)
     make_dir(os.path.join(exp_path, "logs"))
     make_dir(os.path.join(exp_path, "checkpoints"))
+    task_output_path = os.path.join(exp_path, 'cur_task_setting.json')
+    setting.write_ext_JSON(task_output_path)
+    # Make the setting file read-only
+    os.chmod(task_output_path, S_IREAD)
 
     trainer = RegTrainer2D(setting=setting)
     # trainer.export_pt(exp_path)
     # 测试前向传播
     if args.test:
-        _ = trainer.validate(0)
+        _ = trainer.validate(0, save_path = args.save_path)
         del _
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    trainer.train()
+    else:
+        trainer.train()

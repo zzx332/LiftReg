@@ -28,7 +28,8 @@ def prepare(args):
     val_data_path = args.val_data_path
     setting_path = args.setting_path
     continue_from = args.continue_from
-    is_continue = True if continue_from is not None else False
+    gpu_id = args.gpu_id
+
     dataset_name = data_path.split('/')[-1]
 
     # Create experiment folder
@@ -56,14 +57,11 @@ def prepare(args):
     setting.load_JSON(setting_path)
 
     # Update setting file with command input
-    setting["dataset"]["data_path"] = data_path
-    setting["dataset"]["val_data_path"] = val_data_path
-    setting["train"]["output_path"] = exp_folder_path
-    if is_continue:
-        setting["train"]["continue_train"] = True
-        setting["train"]["continue_from"] = continue_from
-    setting["train"]["gpu_ids"] = args.gpu_id
-
+    setting["dataset"]["data_path"] = data_path if data_path is not None else setting["dataset"]["data_path"]
+    setting["dataset"]["val_data_path"] = val_data_path if val_data_path is not None else setting["dataset"]["val_data_path"]
+    setting["train"]["output_path"] = exp_folder_path if exp_folder_path is not None else setting["train"]["output_path"]
+    setting["train"]["gpu_ids"] = gpu_id if gpu_id is not None else setting["train"]["gpu_ids"]
+    setting["train"]["continue_from"] = continue_from if continue_from is not None else setting["train"]["continue_from"]
     # Write the commit hash for current codebase
     label = get_git_revisions_hash()
     setting["exp"]["git_commit"] = label

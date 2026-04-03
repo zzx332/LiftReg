@@ -18,6 +18,12 @@ class loss(nn.Module):
         """minimum regularization factor"""
         self.reg_factor_decay_from = opt[('reg_factor_decay_from', 10, 'regularization factor starts to decay from # epoch')]
 
+        self.vol_sim_factor = opt[('vol_sim_factor', 0.0, '3D volume similarity weight (NCC)')]
+        self.disp_factor = opt[('disp_factor', 0.0, 'displacement consistency weight (MSE)')]
+        from ..layers.losses import NCCLoss, MSELoss
+        self.vol_sim = NCCLoss()
+        self.disp_loss = MSELoss()
+
     def forward(self, input):
         # Parse input data
         warped = input["warped_proj"]
@@ -30,18 +36,37 @@ class loss(nn.Module):
                 align_corners=False,
             )
         params = input["params"]
-        # pca_coefs = input["pca_coefs"]
         epoch = input["epoch"]
         warped = self.normalize_intensity(warped, linear_clip=True, clip_range=[0, 50])
         target = self.normalize_intensity(target, linear_clip=True, clip_range=[0, 50])
         sim_loss = self.sim(warped, target)
+        # reg_loss = torch.tensor(0.0, device=params.device)
         reg_loss = self.compute_reg_loss(params)
-        total_loss = self.sim_factor * sim_loss  + self.get_reg_factor(epoch) * reg_loss
-        # total_loss = self.get_reg_factor(epoch) * reg_loss
+        total_loss = self.sim_factor * sim_loss + self.get_reg_factor(epoch) * reg_loss
+        # total_loss = self.sim_factor * sim_loss
+
+        vol_sim_loss = torch.tensor(0.0, device=params.device)
+        disp_loss = torch.tensor(0.0, device=params.device)
+
+        if self.vol_sim_factor > 0 and 'warped_density_gt' in input:
+            warped_density_gt = input['warped_density_gt']
+            if warped_density_gt.abs().sum() > 0:
+                warped_moving = input['warped_moving']
+                vol_sim_loss = self.vol_sim(warped_moving, warped_density_gt)
+                total_loss = total_loss + self.vol_sim_factor * vol_sim_loss
+
+        if self.disp_factor > 0 and 'displacement_gt' in input:
+            displacement_gt = input['displacement_gt']
+            if displacement_gt.abs().sum() > 0:
+                disp_loss = self.disp_loss(params, displacement_gt)
+                total_loss = total_loss + self.disp_factor * disp_loss
+
         outputs = {
             "total_loss": total_loss,
             "sim_loss": sim_loss.item(),
-            "reg_loss": reg_loss.item()
+            "reg_loss": reg_loss.item(),
+            "vol_sim_loss": vol_sim_loss.item(),
+            "disp_loss": disp_loss.item(),
         }
 
         return outputs

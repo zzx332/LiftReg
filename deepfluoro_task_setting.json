@@ -5,7 +5,7 @@
         "val_data_path": "/home/zzx/data/data/test_shift_only_06",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
-        "augmentation_enable": true,
+        "augmentation_enable": false,
         "aug_affine_prob": 0.3,
         "aug_rotate_deg": 2.0,
         "aug_translate_vox": 4.0,
@@ -33,12 +33,13 @@
             2.2,
             2.2
         ],
-        "use_segmentation_map": true
+        "use_segmentation_map": true,
+        "supervise": false
     },
     "train": {
         "check_best_model_frequency": 1,
         "dataloader": {
-            "batch_size": 2,
+            "batch_size": 1,
             "shuffle": [
                 true,
                 true,
@@ -46,7 +47,7 @@
                 false
             ],
             "workers": [
-                8,
+                4,
                 4,
                 0,
                 0
@@ -61,15 +62,20 @@
             "initial_reg_factor": 0.0005,
             "min_reg_factor": 0.0005,
             "reg_factor_decay_from": 2,
-            "sim_class": "liftreg.layers.losses.NCCLoss"
+            "sim_class": "liftreg.layers.losses.NCCLoss",
+            "vol_sim_factor": 0.5,
+            "disp_factor": 0.1
         },
         "loss_class": "liftreg.losses.Subspace2DLoss.loss",
         "mode": "train",
+        "continue_from": null,
         "model": {
             "drr_feature_num": 1,
             "latent_dim": 56,
             "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca",
-            "use_pca": false
+            "use_pca": false,
+            "use_polyrigid": true,
+            "num_segments": 3
         },
         "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model",
         "network_class": "liftreg.networks.RegistrationNet.RegistrationNet",

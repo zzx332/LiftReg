@@ -83,9 +83,8 @@ class regUNetTrainer:
         self._init_optim(setting["train"]["optim"])
                 # Resume training if specified.
         if self.mode == 'train':
-            self.continue_train = train_setting[('continue_train', False,
-            "for network training method, continue training the model loaded from model_path")]
             continue_from = train_setting['continue_from']
+            self.continue_train = True if continue_from is not None else False
             continue_train_lr = train_setting[('continue_train_lr', -1,
                                 'Used when continue_train=True. The network \
                                 will restore the lr from model_load_path if \
@@ -274,29 +273,36 @@ class regUNetTrainer:
             epoch_losses = []
             reg_losses = []
             sim_losses = []
+            vol_sim_losses = []
+            disp_losses = []
             disp_stats = None
             for i, batch in enumerate(self.dataloaders['train']):
                 global_step = epoch * len(self.dataloaders['train']) + i
-                # 训练步骤
                 loss_dict, disp_stats = self.train_step(self.set_input(batch))
                 epoch_losses.append(loss_dict['total_loss'])
                 reg_losses.append(loss_dict['reg_loss'])
                 sim_losses.append(loss_dict['sim_loss'])
-                # for k,v in loss_dict.items():
-                #     self.writer.add_scalar(f"Train/{k}", v, global_step)        
+                vol_sim_losses.append(loss_dict.get('vol_sim_loss', 0.0))
+                disp_losses.append(loss_dict.get('disp_loss', 0.0))
             
             avg_loss = np.mean(epoch_losses)
             avg_reg_loss = np.mean(reg_losses)
             avg_sim_loss = np.mean(sim_losses)
+            avg_vol_sim_loss = np.mean(vol_sim_losses)
+            avg_disp_loss = np.mean(disp_losses)
             print(f"  平均total loss: {avg_loss:.4f}")
             print(f"  平均reg loss: {avg_reg_loss:.4f}")
             print(f"  平均sim loss: {avg_sim_loss:.4f}")
+            print(f"  平均vol_sim loss: {avg_vol_sim_loss:.4f}")
+            print(f"  平均disp loss: {avg_disp_loss:.4f}")
             if disp_stats is not None:
                 print(f"  max displacement: {disp_stats['max']:.4f}")
                 print(f"  min displacement: {disp_stats['min']:.4f}")
             self.writer.add_scalar("Train/total_loss_epoch", avg_loss, epoch)
             self.writer.add_scalar("Train/reg_loss_epoch", avg_reg_loss, epoch)
             self.writer.add_scalar("Train/sim_loss_epoch", avg_sim_loss, epoch)
+            self.writer.add_scalar("Train/vol_sim_loss_epoch", avg_vol_sim_loss, epoch)
+            self.writer.add_scalar("Train/disp_loss_epoch", avg_disp_loss, epoch)
             if (epoch + 1) % 20 == 0:
                 self.save_checkpoint(epoch)
             # 验证阶段

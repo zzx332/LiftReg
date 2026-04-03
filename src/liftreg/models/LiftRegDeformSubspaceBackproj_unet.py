@@ -129,10 +129,10 @@ class model(nn.Module):
             )
         
         # ===== Output Layer =====
-        # Solution 1: Using PCA subspace (keep original way)
-        if opt["use_pca"]:
-            # Global average pooling + fully connected layers
-            self.use_pca = True
+        self.use_pca = opt["use_pca"]
+        self.use_polyrigid = opt["use_polyrigid"]
+
+        if self.use_pca:
             self.global_pool = nn.AdaptiveAvgPool3d(1)
             self.fc_layers = nn.Sequential(
                 nn.Flatten(),
@@ -140,19 +140,26 @@ class model(nn.Module):
                 nn.ReLU(inplace=True),
                 nn.Linear(256, opt["latent_dim"])
             )
-            
-            # Load PCA components
             self.pca_vectors = torch.from_numpy(
                 np.load(f"{opt['pca_path']}/pca_vectors.npy").T
             ).float().cuda()
             self.pca_mean = torch.from_numpy(
                 np.load(f"{opt['pca_path']}/pca_mean.npy")
             ).float().cuda()
+        elif self.use_polyrigid:
+            self.num_segments = opt["num_segments"]
+            self.global_pool = nn.AdaptiveAvgPool3d(1)
+            self.fc_polyrigid = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(base_channels, 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, self.num_segments * 3),
+            )
+            self.fc_polyrigid[-1].weight.data.normal_(mean=0.0, std=0.1)
+            self.fc_polyrigid[-1].bias.data.zero_()
         else:
-            # Solution 2: Directly output displacement field
-            self.use_pca = False
             self.output_conv = nn.Conv3d(
-                base_channels, 3,  # Output 3 channels (x, y, z displacement)
+                base_channels, 3,
                 kernel_size=3, padding=1
             )
             self.output_conv.weight.data.normal_(mean=0.0, std=1e-5)
@@ -203,62 +210,64 @@ class model(nn.Module):
             self.memory_logger(stage)
 
     def forward(self, input):
-        # Parse input
         moving = input['source']
         target_proj = input["target_proj"]
         target_volume = input["target_volume"]
         if 'source_label' in input:
             moving_seg = input['source_label']
-            # target_seg = input['target_label']
-            moving_cp = (moving+1)*moving_seg-1
-            # target_cp = (target+1)*target_seg-1
+            moving_cp = (moving + 1) * moving_seg - 1
         else:
             moving_cp = moving
-            # target_cp = target
-        
+
         B, _, W, H, D = moving.shape
         density = input['density']
         target_poses = input['target_poses'].to(density.device)
         affine_inverse = input['affine'].inverse().to(density.device)
-        # Estimating Deformation Fields
+
         coefs, disp_field = self._estimate_flow(moving, target_volume)
         self._log_memory("model/after_estimate_flow")
-        # Applying Deformation
+
+        if self.use_polyrigid:
+            seg_weights = input['weights'].to(density.device)
+            affine_mat = input['affine'].to(density.device)
+            disp_field = self._polyrigid_to_displacement(
+                coefs, seg_weights, affine_mat, (W, H, D))
+            self._log_memory("model/after_polyrigid_disp")
+
         disp_norm = disp_field.clone()
-        disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))  # x
-        disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))  # y
-        disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))  # z
+        disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))
+        disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))
+        disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))
         deform_field = disp_norm + self.id_transform
         self._log_memory("model/after_deform_field")
+
         warped_moving = self.bilinear(density, deform_field)
         self._log_memory("model/after_warp")
-        # warped_proj = self.renderer(warped_moving[0, 0], target_poses, affine_inverse).view(B,
-        #     -1,
-        #     self.detector.height,
-        #     self.detector.width)
+
         warped_projs = []
         for b in range(B):
             proj_b = self.renderer(
-                warped_moving[b, 0],           # (W, H, D) 单个 density
-                target_poses[b],               # 第 b 个样本的 pose
-                affine_inverse[b],             # 第 b 个样本的 affine inverse
+                warped_moving[b, 0],
+                target_poses[b],
+                affine_inverse[b],
             )
             warped_projs.append(proj_b)
         warped_proj = torch.cat(warped_projs, dim=0).view(
             B, -1, self.detector.height, self.detector.width
         )
         self._log_memory("model/after_full_projection_render")
- 
+
         model_output = {
-            # "warped": warped_source,
             "warped_moving": warped_moving,
-            # "phi": deform_field,
             "params": disp_field,
-            # "target": target_cp,
             "pca_coefs": coefs,
             "target_proj": target_proj,
-            "warped_proj": warped_proj
+            "warped_proj": warped_proj,
         }
+        if 'warped_density_gt' in input:
+            model_output['warped_density_gt'] = input['warped_density_gt']
+        if 'displacement_gt' in input:
+            model_output['displacement_gt'] = input['displacement_gt']
         return model_output
         
     def renderer(self, density, target_poses, affine_inverse):
@@ -322,45 +331,62 @@ class model(nn.Module):
         return density
 
     def _estimate_flow(self, moving, target_volume):
-        """Estimating Deformation Fields using ResUNet"""
+        """Estimate deformation parameters using ResUNet encoder-decoder."""
         B, _, W, H, D = moving.shape
 
-        # Concatenate input
         x = torch.cat([moving, target_volume], dim=1)
-        
-        # ===== Encoder Path =====
+
         x = self.init_conv(x)
-        
-        # Save skip connections
         skip_connections = [x]
-        
+
         for encoder in self.encoders:
             x = encoder(x)
             skip_connections.append(x)
-        
-        # ===== Bottleneck Layer =====
+
         x = self.bottleneck(x)
-        
-        # ===== Decoder Path =====
-        skip_connections = skip_connections[::-1][1:]  # Reverse and remove the last one
-        
+
+        skip_connections = skip_connections[::-1][1:]
         for i, decoder in enumerate(self.decoders):
             x = decoder(x, skip_connections[i])
-        
-        # ===== Output Layer =====
+
         if self.use_pca:
-            # Using PCA subspace
             features = self.global_pool(x)
             coefs = self.fc_layers(features)
             disp_field = F.linear(coefs, self.pca_vectors, self.pca_mean).reshape(
                 B, 3, D, H, W
             )
+            return coefs, disp_field
+        elif self.use_polyrigid:
+            features = self.global_pool(x)
+            raw = self.fc_polyrigid(features)  # (B, K*3)
+            polyrigid_params = raw.view(B, self.num_segments, 3)
+            return polyrigid_params, None
         else:
-            # Directly output displacement field
             disp_field = self.output_conv(x)
-            coefs = None
-        
-        return coefs, disp_field
+            return None, disp_field
+
+    def _polyrigid_to_displacement(self, polyrigid_params, weights, affine, spatial_shape):
+        """
+        Pure-translation polyrigid: weighted sum of per-segment translation vectors.
+
+        Each voxel's displacement = sum_k( w_k * t_k ), where t_k is the predicted
+        translation for segment k and w_k is its segmentation weight at that voxel.
+
+        No SE3 exponential map, no affine composition — a single einsum suffices.
+
+        Args:
+            polyrigid_params: (B, K, 3) predicted translation per segment (voxel units)
+            weights: (B, K, W, H, D) segmentation blending weights
+            affine:  unused (kept for interface compatibility)
+            spatial_shape: unused (kept for interface compatibility)
+
+        Returns:
+            disp_field: (B, 3, W, H, D) dense voxel-unit displacement field
+        """
+        # weights: (B, K, W, H, D)   polyrigid_params: (B, K, 3)
+        # result:  (B, 3, W, H, D)
+        disp_field = torch.einsum("bkwhd,bkn->bnwhd", weights, polyrigid_params)
+        return disp_field
     
     def get_extra_to_plot(self):
         return None, None

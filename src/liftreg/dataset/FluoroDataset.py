@@ -109,6 +109,7 @@ class FluoroDataset(Dataset):
         self.drr_path  = os.path.join(self.data_path, "drr")
         self.cache_dir = os.path.join(self.data_path, "preprocessed")
         self.warp_path = os.path.join(self.data_path, "warp_pose")
+        self.warped_data_path = os.path.join(self.data_path, "warped_data")
         self.warp_pose_cache = {}
         
         os.makedirs(self.cache_dir, exist_ok=True)
@@ -123,6 +124,8 @@ class FluoroDataset(Dataset):
 
         self.has_label = option[('use_segmentation_map', False,
                                  'load segmentation maps')]
+        self.supervise = option[('supervise', False,
+                                 'use warped density GT for supervision')]
         self.spacing   = option[('spacing_to_refer', (1, 1, 1), '')]
         self.load_projection_interval = option[('load_projection_interval', 1, '')]
         self.apply_hu_clip = option[('apply_hu_clip', False, '')]
@@ -269,6 +272,10 @@ class FluoroDataset(Dataset):
             device=torch.device('cpu')).permute(2, 1, 0) # (X, Y, Z)
         target_volume_np = target_volume.detach().cpu().numpy().astype(np.float32) # (X, Y, Z)
 
+        # ---- 3b. Load warped density GT (if available) ----
+        warped_gt_name = identifier.replace("drr", "density_") + ".nii.gz"
+        warped_gt_file = os.path.join(self.warped_data_path, warped_gt_name)
+
         # ---- 4. Save to disk ----
         save_dict = dict(
             source=source_arr,
@@ -281,6 +288,16 @@ class FluoroDataset(Dataset):
             save_dict['source_seg'] = (
                 source_seg.data.squeeze(0).numpy().astype(np.float32))
             save_dict['weights'] = weights.detach().cpu().numpy().astype(np.float32)
+        if os.path.exists(warped_gt_file):
+            warped_gt_img = ScalarImage(warped_gt_file)
+            warped_gt_img = self.canonicalize(warped_gt_img)
+            tfm_wgt = torchio.transforms.Compose([
+                torchio.transforms.Resample((2.2, 2.2, 2.2)),
+                torchio.transforms.CropOrPad((160, 160, 160), padding_mode=0),
+            ])
+            warped_gt_img = tfm_wgt(warped_gt_img)
+            save_dict['warped_density_gt'] = (
+                warped_gt_img.data.squeeze(0).numpy().astype(np.float32))
         np.savez_compressed(npz_path, **save_dict)
 
         torch.save(dict(
@@ -642,23 +659,29 @@ class FluoroDataset(Dataset):
                          if self.has_label else None)
         affine        = meta['affine'].clone()
 
+        # ---- Load warped density GT from cache (for 3D volume similarity loss) ----
+        if self.supervise:
+            has_warped_gt = 'warped_density_gt' in npz
+            warped_density_gt = (
+                np.ascontiguousarray(npz['warped_density_gt'].astype(np.float32))
+                if has_warped_gt else np.zeros_like(source))
+            displacement_gt = np.zeros((3, *source.shape), dtype=np.float32)
+
         # ---- Online augmentation (train phase only) ----
         if self.enable_aug:
             affine_grid = None
-            # if np.random.rand() < self.aug_lr_flip_prob:
-            #     (source, density, source_seg, weights,
-            #      target_proj, target_volume, affine) = self._apply_lr_flip(
-            #         source, density, source_seg, weights,
-            #         target_proj, target_volume, affine)
             (source_aug, density, source_seg, weights,
              affine, affine_grid) = self._apply_shared_affine_3d(
                 source, density, source_seg, weights, affine)
 
-            # source_aug        = self._augment_3d_intensity(source)
-            # target_proj_aug, aug_tag = self._augment_2d_proj(target_proj)
             if affine_grid is not None:
                 warp = Warp(density, source_seg, weights, poses_rot, poses_xyz, affine)
                 warped_density, warped_mask, displacement = warp()
+                warped_density_gt = warped_density.detach().cpu().numpy().astype(np.float32)
+                if self.supervise:
+                    displacement_gt = np.transpose(
+                        displacement.detach().cpu().numpy().astype(np.float32),
+                        (3, 0, 1, 2))  # (D,H,W,3) -> (3,D,H,W)
                 self._init_projector_if_needed()
                 target_proj_aug = self._run_renderer(
                     warped_density, meta['target_poses'], affine.inverse())[0].detach().cpu().numpy()
@@ -700,7 +723,17 @@ class FluoroDataset(Dataset):
         }
         if self.has_label and source_seg is not None:
             sample['source_label'] = np.expand_dims(source_seg, 0)  # (1,D,H,W)
-            # sample['weights'] = np.expand_dims(weights, 0)  # (1,D,H,W)
+        if self.has_label and weights is not None:
+            weights_t = torch.from_numpy(weights).unsqueeze(0).float()
+            weights_interp = F.interpolate(
+                weights_t, size=source.shape, mode='trilinear', align_corners=False
+            ).squeeze(0).numpy().astype(np.float32)
+            sample['weights'] = weights_interp  # (K,D,H,W)
+        if self.supervise:
+            warped_density_gt = np.ascontiguousarray(warped_density_gt.astype(np.float32))
+            displacement_gt = np.ascontiguousarray(displacement_gt.astype(np.float32))
+            sample['warped_density_gt'] = np.expand_dims(warped_density_gt, 0)
+            sample['displacement_gt'] = displacement_gt
 
         if self.transform:
             sample['source'] = self.transform(sample['source'])
