@@ -351,7 +351,33 @@ class regUNetTrainer:
             else:
                 self.lr_scheduler.step()
 
-    def test_forward(self):
+    def save_output(self, batch, output, save_path, identifier):
+        make_dir(save_path)
+        import SimpleITK as sitk
+        def save_tensor_arr(tensor_arr, path):
+            sitk.WriteImage(sitk.GetImageFromArray(tensor_arr[:,0].detach().cpu().numpy()), path)
+        B = batch['source'].shape[0]
+        prefix_name = '_'.join([identifier[i].split('.')[0][-2:] for i in range(B)])
+        save_name = f"{identifier[0].split('_')[0]}_{prefix_name}"
+        moving_projs = []
+        density = batch['source'].to(self.device)
+        target_poses = batch['target_poses'].to(self.device)
+        affine_inverse = batch['affine'].inverse().to(self.device)
+        for b in range(B):
+            proj_b = self.model.renderer(
+                density[b, 0],           # (W, H, D) 单个 density
+                target_poses[b],               # 第 b 个样本的 pose
+                affine_inverse[b],             # 第 b 个样本的 affine inverse
+            )
+            moving_projs.append(proj_b)
+        moving_proj = torch.cat(moving_projs, dim=0).view(
+            B, -1, output['target_proj'].shape[2], output['target_proj'].shape[3]
+        )
+        save_tensor_arr(moving_proj, os.path.join(save_path, f"{save_name}_moving.nii.gz"))
+        save_tensor_arr(output['target_proj'], os.path.join(save_path, f"{save_name}_fixed.nii.gz"))
+        save_tensor_arr(output['warped_proj'], os.path.join(save_path, f"{save_name}_warped.nii.gz"))
+
+    def test_forward(self, save_path=None):
         """测试前向传播"""
         print("\n测试前向传播...")
         test_iter = iter(self.dataloaders['val'])
@@ -360,6 +386,9 @@ class regUNetTrainer:
             data = next(test_iter)
             with torch.no_grad():
                 output = self.model(self.set_input(data))
+                if save_path is not None:
+                    self.save_output(self.set_input(data), output, save_path, data[1])
+                    continue
         
         print("输入形状:")
         for key, value in self.set_input(data).items():

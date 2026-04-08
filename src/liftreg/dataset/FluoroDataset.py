@@ -110,7 +110,7 @@ class FluoroDataset(Dataset):
         self.cache_dir = os.path.join(self.data_path, "preprocessed")
         self.warp_path = os.path.join(self.data_path, "warp_pose")
         self.warped_data_path = os.path.join(self.data_path, "warped_data")
-        self.warp_pose_cache = {}
+        self.cache_version = 2
         
         os.makedirs(self.cache_dir, exist_ok=True)
 
@@ -135,6 +135,11 @@ class FluoroDataset(Dataset):
             option[('augmentation_enable', True, 'enable data augmentation')]
             and (phase == 'train')
         )
+        self.offline_aug_variants = int(
+            option[('offline_aug_variants', 4, 'number of cached affine augmentation variants')]
+        )
+        if not self.enable_aug:
+            self.offline_aug_variants = 0
         self.aug_gamma_prob      = option[('aug_gamma_prob',      0.4, '')]
         self.aug_brightness_prob = option[('aug_brightness_prob', 0.5, '')]
         self.aug_noise_prob      = option[('aug_noise_prob',      0.5, '')]
@@ -203,6 +208,118 @@ class FluoroDataset(Dataset):
 
         # return ScalarImage(volume), LabelMap(mask), xrays, LabelMap(segs)
         return volume, mask, xrays, segs
+
+    def _cache_is_valid(self, npz_path, meta_path):
+        if not (os.path.exists(npz_path) and os.path.exists(meta_path)):
+            return False
+
+        try:
+            with np.load(npz_path) as npz:
+                required_keys = {
+                    'cache_version', 'source', 'density', 'target_proj', 'target_volume', 'spacing'
+                }
+                if self.has_label:
+                    required_keys.update({'source_seg', 'weights'})
+                if self.supervise:
+                    required_keys.add('warped_density_gt')
+                if self.offline_aug_variants > 0:
+                    required_keys.update({
+                        'aug_source', 'aug_density', 'aug_target_proj',
+                        'aug_target_volume', 'aug_affines'
+                    })
+                    if self.has_label:
+                        required_keys.update({'aug_source_seg', 'aug_weights'})
+                    if self.supervise:
+                        required_keys.update({'aug_warped_density_gt', 'aug_displacement_gt'})
+
+                if not required_keys.issubset(set(npz.files)):
+                    return False
+
+                cache_version = int(np.asarray(npz['cache_version']).reshape(-1)[0])
+                if cache_version != self.cache_version:
+                    return False
+
+                if self.offline_aug_variants > 0:
+                    if npz['aug_source'].shape[0] != self.offline_aug_variants:
+                        return False
+        except Exception:
+            return False
+
+        return True
+
+    def _build_offline_augmented_bank_3d(
+        self, identifier, source, density, source_seg, weights, affine, target_poses, target_poses_SOUV
+    ):
+        if self.offline_aug_variants <= 0 or source_seg is None or weights is None:
+            return None
+
+        rot_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt')
+        xyz_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_xyz_")}.pt')
+        poses_rot = torch.load(rot_path, map_location="cpu", weights_only=True)
+        poses_xyz = torch.load(xyz_path, map_location="cpu", weights_only=True)
+
+        aug_source = []
+        aug_density = []
+        aug_source_seg = []
+        aug_weights = []
+        aug_target_proj = []
+        aug_target_volume = []
+        aug_affines = []
+        aug_warped_density_gt = [] if self.supervise else None
+        aug_displacement_gt = [] if self.supervise else None
+
+        for _ in range(self.offline_aug_variants):
+            (source_aug, density_aug, source_seg_aug, weights_aug,
+             affine_aug, affine_grid) = self._apply_shared_affine_3d(
+                source, density, source_seg, weights, affine.clone(), force=True)
+
+            warp = Warp(density_aug, source_seg_aug, weights_aug, poses_rot, poses_xyz, affine_aug)
+            warped_density, _, displacement = warp()
+
+            target_proj_aug = self._run_renderer(
+                warped_density, target_poses, affine_aug.inverse())[0].detach().cpu().numpy()
+            proj_for_bp = torch.from_numpy(target_proj_aug).flip(dims=[1, 2])
+            target_volume_aug = self.backproject_volume(
+                target_poses_SOUV, proj_for_bp, source_aug.shape,
+                device=torch.device('cpu')).cpu().numpy()
+            target_volume_aug = np.transpose(target_volume_aug, (2, 1, 0))
+            target_volume_aug = self._apply_affine_grid(
+                target_volume_aug, affine_grid, mode='bilinear', padding_mode='border')
+
+            aug_source.append(np.ascontiguousarray(source_aug.astype(np.float32)))
+            aug_density.append(np.ascontiguousarray(density_aug.astype(np.float32)))
+            aug_source_seg.append(np.ascontiguousarray(source_seg_aug.astype(np.float32)))
+            aug_weights.append(np.ascontiguousarray(weights_aug.astype(np.float32)))
+            aug_target_proj.append(np.ascontiguousarray(target_proj_aug.astype(np.float32)))
+            aug_target_volume.append(np.ascontiguousarray(target_volume_aug.astype(np.float32)))
+            aug_affines.append(affine_aug.numpy().astype(np.float32))
+            if self.supervise:
+                aug_warped_density_gt.append(
+                    np.ascontiguousarray(warped_density.detach().cpu().numpy().astype(np.float32))
+                )
+                aug_displacement_gt.append(
+                    np.transpose(
+                        displacement.detach().cpu().numpy().astype(np.float32),
+                        (3, 0, 1, 2)
+                    )
+                )
+
+        if len(aug_source) == 0:
+            return None
+
+        save_dict = {
+            'aug_source': np.stack(aug_source, axis=0).astype(np.float32),
+            'aug_density': np.stack(aug_density, axis=0).astype(np.float32),
+            'aug_source_seg': np.stack(aug_source_seg, axis=0).astype(np.float32),
+            'aug_weights': np.stack(aug_weights, axis=0).astype(np.float32),
+            'aug_target_proj': np.stack(aug_target_proj, axis=0).astype(np.float32),
+            'aug_target_volume': np.stack(aug_target_volume, axis=0).astype(np.float32),
+            'aug_affines': np.stack(aug_affines, axis=0).astype(np.float32),
+        }
+        if self.supervise:
+            save_dict['aug_warped_density_gt'] = np.stack(aug_warped_density_gt, axis=0).astype(np.float32)
+            save_dict['aug_displacement_gt'] = np.stack(aug_displacement_gt, axis=0).astype(np.float32)
+        return save_dict
     # ------------------------------------------------------------------
     # Stage 1 – Preprocessing & caching  (runs once per identifier)
     # ------------------------------------------------------------------
@@ -210,7 +327,7 @@ class FluoroDataset(Dataset):
         """Preprocess one CT/pose pair and save results to disk."""
         npz_path  = os.path.join(self.cache_dir, f'{identifier}.npz')
         meta_path = os.path.join(self.cache_dir, f'{identifier}_meta.pt')
-        if os.path.exists(npz_path) and os.path.exists(meta_path):
+        if self._cache_is_valid(npz_path, meta_path):
             return  # already cached
 
         self._init_projector_if_needed()
@@ -278,6 +395,7 @@ class FluoroDataset(Dataset):
 
         # ---- 4. Save to disk ----
         save_dict = dict(
+            cache_version=np.array([self.cache_version], dtype=np.int16),
             source=source_arr,
             density=density_arr,
             target_proj=target_proj_np, # (P, H, W)
@@ -298,6 +416,21 @@ class FluoroDataset(Dataset):
             warped_gt_img = tfm_wgt(warped_gt_img)
             save_dict['warped_density_gt'] = (
                 warped_gt_img.data.squeeze(0).numpy().astype(np.float32))
+        elif self.supervise:
+            save_dict['warped_density_gt'] = np.zeros_like(source_arr, dtype=np.float32)
+
+        aug_dict = self._build_offline_augmented_bank_3d(
+            identifier,
+            source_arr,
+            density_arr,
+            save_dict.get('source_seg', None),
+            save_dict.get('weights', None),
+            affine,
+            target_poses,
+            target_poses_SOUV,
+        )
+        if aug_dict is not None:
+            save_dict.update(aug_dict)
         np.savez_compressed(npz_path, **save_dict)
 
         torch.save(dict(
@@ -321,12 +454,6 @@ class FluoroDataset(Dataset):
                 os.path.join(self.cache_dir, f'{identifier}_meta.pt'),
                 weights_only=False)
             self.meta_cache[identifier] = {"meta": meta}
-            rot_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt')
-            xyz_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_xyz_")}.pt')
-            self.warp_pose_cache[identifier] = {
-                "poses_rot": torch.load(rot_path, map_location="cpu", weights_only=True),
-                "poses_xyz": torch.load(xyz_path, map_location="cpu", weights_only=True),
-            }
             pbar.update(i + 1)
 
         pbar.finish()
@@ -358,70 +485,70 @@ class FluoroDataset(Dataset):
 
         return np.clip(arr, -1.0, 1.0).astype(np.float32)
 
-    def _augment_2d_proj(self, proj):
+    def _augment_2d_projs_shared(self, *projs):
         """
-        X-ray physics-aware augmentation for a (P, H, W) float32 array in [-1, 1].
+        X-ray physics-aware augmentation for one or more (P, H, W) float32 stacks.
+
+        One random draw per batch (bernoulli + branch + hyperparameters) is
+        shared across all inputs so source_proj and target_proj see the same
+        corruption type and strength; each image keeps its own min/max rescale.
 
         Three physics-motivated transforms (mutually exclusive, one chosen per call):
-          1. Poisson noise  – models photon-counting shot noise in X-ray detectors.
-          2. Gaussian blur  – models focal-spot blur / detector PSF degradation.
-          3. Log-transform  – models the Beer-Lambert law nonlinearity that maps
-                              raw detector intensity to equivalent path length;
-                              a random strength parameter controls its severity.
+          1. Poisson noise  – models shot noise (same lam for all stacks).
+          2. Gaussian blur  – same sigma for all stacks.
+          3. Log-transform  – same alpha for all stacks.
 
-        Each transform is applied with probability aug_noise_prob.
-        Brightness/contrast jitter is always applied independently before them.
+        Applied with probability aug_noise_prob.
         """
-        proj = proj.copy()
-        aug_tag = False 
-        if np.random.rand() < self.aug_noise_prob:
-            choice = np.random.randint(0, 3)
+        if not projs:
+            return tuple(), False
 
-            # Rescale [-1, 1] → [0, 1] for all three transforms
-            # p01 = np.clip((proj + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
-            p_min = float(proj.min())
-            p_max = float(proj.max())
+        aug_copies = tuple(p.astype(np.float32).copy() for p in projs)
+        aug_tag = False
+        if np.random.rand() >= self.aug_noise_prob:
+            return aug_copies + (aug_tag,)
+
+        choice = np.random.randint(0, 3)
+        metas = []
+        p01_list = []
+        for p in aug_copies:
+            p_min = float(p.min())
+            p_max = float(p.max())
             p_range = max(p_max - p_min, 1e-6)
-            p01 = np.clip((proj - p_min) / p_range, 0.0, 1.0).astype(np.float32)
+            p01 = np.clip((p - p_min) / p_range, 0.0, 1.0).astype(np.float32)
+            metas.append((p_min, p_max, p_range))
+            p01_list.append(p01)
 
-            if choice == 0:
-                # --- Poisson noise ---
-                # Simulate photon counts: scale p01 to a mean count level,
-                # draw Poisson samples, then rescale back.
-                # lam controls SNR: higher lam = less noise.
-                lam = float(np.random.uniform(300.0, 1000.0))
-                counts = np.random.poisson(p01 * lam).astype(np.float32)
-                p01 = np.clip(counts / lam, 0.0, 1.0)
+        if choice == 0:
+            # lam = float(np.random.uniform(300.0, 1000.0))
+            lam = float(np.random.uniform(2000.0, 5000.0))
+            p01_list = [
+                np.clip(np.random.poisson(p01 * lam).astype(np.float32) / lam, 0.0, 1.0)
+                for p01 in p01_list
+            ]
+        elif choice == 1:
+            from scipy.ndimage import gaussian_filter
 
-            elif choice == 1:
-                # --- Gaussian blur (detector PSF / focal-spot blur) ---
-                # Apply a separable Gaussian filter independently to each
-                # projection frame using a small kernel.
-                from scipy.ndimage import gaussian_filter
-                sigma_blur = float(np.random.uniform(0.5, 2.0))
+            sigma_blur = float(np.random.uniform(0.5, 2.0))
+            new_list = []
+            for p01 in p01_list:
+                out = np.empty_like(p01)
                 for i in range(p01.shape[0]):
-                    p01[i] = gaussian_filter(p01[i], sigma=sigma_blur).astype(np.float32)
+                    out[i] = gaussian_filter(p01[i], sigma=sigma_blur).astype(np.float32)
+                new_list.append(out)
+            p01_list = new_list
+        else:
+            alpha = float(np.random.uniform(2.0, 10.0))
+            log_denom = float(np.log1p(alpha))
+            p01_list = [
+                (np.log1p(alpha * p01) / log_denom).astype(np.float32) for p01 in p01_list
+            ]
 
-            else:
-                # --- Log-transform (Beer-Lambert nonlinearity) ---
-                # I_out = log(1 + alpha * I) / log(1 + alpha)
-                # alpha controls transform strength: large alpha compresses highlights.
-                alpha = float(np.random.uniform(2.0, 10.0))
-                p01 = (np.log1p(alpha * p01) / np.log1p(alpha)).astype(np.float32)
-
-            # proj = np.clip(p01 * 2.0 - 1.0, -1.0, 1.0)
-            proj = np.clip(p01 * p_range + p_min, p_min, p_max)
-            aug_tag = True
-        # ---- Rectangular occlusion (simulate surgical instruments / table edge) ----
-        # if np.random.rand() < self.aug_proj_mask_prob:
-        #     _, H, W = proj.shape
-        #     rh = int(H * np.random.uniform(0.05, 0.20))
-        #     rw = int(W * np.random.uniform(0.05, 0.20))
-        #     y0 = np.random.randint(0, max(1, H - rh))
-        #     x0 = np.random.randint(0, max(1, W - rw))
-        #     proj[:, y0:y0 + rh, x0:x0 + rw] = float(proj.min())
-
-        return proj.astype(np.float32), aug_tag  # 已由上面的 clip 保证在原始值域内
+        out = []
+        for p01, (p_min, p_max, p_range) in zip(p01_list, metas):
+            out.append(np.clip(p01 * p_range + p_min, p_min, p_max).astype(np.float32))
+        aug_tag = True
+        return tuple(out) + (aug_tag,)
 
     def _resolve_axis_ranges(self, value, symmetric=False):
         arr = np.asarray(value, dtype=np.float32)
@@ -500,8 +627,8 @@ class FluoroDataset(Dataset):
             mat[2, 3] = 0.0
         return mat
 
-    def _build_shared_affine(self, vol_shape):
-        if np.random.rand() >= self.aug_affine_prob:
+    def _build_shared_affine(self, vol_shape, force=False):
+        if (not force) and np.random.rand() >= self.aug_affine_prob:
             return None, None
 
         rotate_ranges = self._resolve_axis_ranges(self.aug_rotate_deg, symmetric=True)
@@ -583,8 +710,8 @@ class FluoroDataset(Dataset):
         sampled = sampled.squeeze(0).cpu().numpy().astype(np.float32)
         return sampled[0] if arr.ndim == 3 else sampled
 
-    def _apply_shared_affine_3d(self, source, density, source_seg, weights, affine):
-        grid, voxel_to_input = self._build_shared_affine(source.shape)
+    def _apply_shared_affine_3d(self, source, density, source_seg, weights, affine, force=False):
+        grid, voxel_to_input = self._build_shared_affine(source.shape, force=force)
         if grid is None:
             return source, density, source_seg, weights, affine, None
 
@@ -643,59 +770,54 @@ class FluoroDataset(Dataset):
         idx        = idx % len(self.identifier_list)
         identifier = self.identifier_list[idx]
         meta       = self.meta_cache[identifier]["meta"]
-        cache = self.warp_pose_cache[identifier]
-        poses_rot = cache["poses_rot"]
-        poses_xyz = cache["poses_xyz"]
+        affine     = meta['affine'].clone()
         # ---- Load preprocessed arrays from disk (fast np.load) ----
-        npz           = np.load(os.path.join(self.cache_dir, f'{identifier}.npz'))
-        source        = np.ascontiguousarray(npz['source'].astype(np.float32))         # (D, H, W)
-        density       = np.ascontiguousarray(npz['density'].astype(np.float32))        # (D, H, W)
-        target_proj   = np.ascontiguousarray(npz['target_proj'].astype(np.float32))    # (P, H, W)
-        target_volume = np.ascontiguousarray(npz['target_volume'].astype(np.float32))  # (D, H, W)
-        spacing       = np.ascontiguousarray(npz['spacing'].astype(np.float32))
-        source_seg    = (np.ascontiguousarray(npz['source_seg'].astype(np.float32))
-                         if self.has_label else None)
-        weights       = (np.ascontiguousarray(npz['weights'].astype(np.float32))
-                         if self.has_label else None)
-        affine        = meta['affine'].clone()
+        npz_path = os.path.join(self.cache_dir, f'{identifier}.npz')
+        with np.load(npz_path) as npz:
+            source        = np.ascontiguousarray(npz['source'].astype(np.float32))         # (D, H, W)
+            density       = np.ascontiguousarray(npz['density'].astype(np.float32))        # (D, H, W)
+            target_proj   = np.ascontiguousarray(npz['target_proj'].astype(np.float32))    # (P, H, W)
+            target_volume = np.ascontiguousarray(npz['target_volume'].astype(np.float32))  # (D, H, W)
+            spacing       = np.ascontiguousarray(npz['spacing'].astype(np.float32))
+            source_seg    = (np.ascontiguousarray(npz['source_seg'].astype(np.float32))
+                             if self.has_label else None)
+            weights       = (np.ascontiguousarray(npz['weights'].astype(np.float32))
+                             if self.has_label else None)
 
-        # ---- Load warped density GT from cache (for 3D volume similarity loss) ----
-        if self.supervise:
-            has_warped_gt = 'warped_density_gt' in npz
-            warped_density_gt = (
-                np.ascontiguousarray(npz['warped_density_gt'].astype(np.float32))
-                if has_warped_gt else np.zeros_like(source))
-            displacement_gt = np.zeros((3, *source.shape), dtype=np.float32)
+            # ---- Load warped density GT from cache (for 3D volume similarity loss) ----
+            if self.supervise:
+                has_warped_gt = 'warped_density_gt' in npz
+                warped_density_gt = (
+                    np.ascontiguousarray(npz['warped_density_gt'].astype(np.float32))
+                    if has_warped_gt else np.zeros_like(source))
+                displacement_gt = np.zeros((3, *source.shape), dtype=np.float32)
 
+            if self.enable_aug and self.offline_aug_variants > 0 and 'aug_source' in npz:
+                if np.random.rand() < self.aug_affine_prob:
+                    aug_idx = np.random.randint(npz['aug_source'].shape[0])
+                    source = np.ascontiguousarray(npz['aug_source'][aug_idx].astype(np.float32))
+                    density = np.ascontiguousarray(npz['aug_density'][aug_idx].astype(np.float32))
+                    target_proj = np.ascontiguousarray(npz['aug_target_proj'][aug_idx].astype(np.float32))
+                    target_volume = np.ascontiguousarray(npz['aug_target_volume'][aug_idx].astype(np.float32))
+                    affine = torch.from_numpy(npz['aug_affines'][aug_idx].astype(np.float32))
+                    if self.has_label and 'aug_source_seg' in npz:
+                        source_seg = np.ascontiguousarray(npz['aug_source_seg'][aug_idx].astype(np.float32))
+                    if self.has_label and 'aug_weights' in npz:
+                        weights = np.ascontiguousarray(npz['aug_weights'][aug_idx].astype(np.float32))
+                    if self.supervise and 'aug_warped_density_gt' in npz:
+                        warped_density_gt = np.ascontiguousarray(
+                            npz['aug_warped_density_gt'][aug_idx].astype(np.float32))
+                    if self.supervise and 'aug_displacement_gt' in npz:
+                        displacement_gt = np.ascontiguousarray(
+                            npz['aug_displacement_gt'][aug_idx].astype(np.float32))
         # ---- Online augmentation (train phase only) ----
         if self.enable_aug:
-            affine_grid = None
-            (source_aug, density, source_seg, weights,
-             affine, affine_grid) = self._apply_shared_affine_3d(
-                source, density, source_seg, weights, affine)
-
-            if affine_grid is not None:
-                warp = Warp(density, source_seg, weights, poses_rot, poses_xyz, affine)
-                warped_density, warped_mask, displacement = warp()
-                warped_density_gt = warped_density.detach().cpu().numpy().astype(np.float32)
-                if self.supervise:
-                    displacement_gt = np.transpose(
-                        displacement.detach().cpu().numpy().astype(np.float32),
-                        (3, 0, 1, 2))  # (D,H,W,3) -> (3,D,H,W)
-                self._init_projector_if_needed()
-                target_proj_aug = self._run_renderer(
-                    warped_density, meta['target_poses'], affine.inverse())[0].detach().cpu().numpy()
-                proj_for_bp = (torch.from_numpy(target_proj_aug).flip(dims=[1, 2]))
-                target_volume_aug = self.backproject_volume(
-                    meta['target_poses_SOUV'], proj_for_bp, source_aug.shape,
-                    device=torch.device('cpu')).cpu().numpy()
-                target_volume_aug = np.transpose(target_volume_aug, (2, 1, 0))
-                target_volume_aug = self._apply_affine_grid(
-                    target_volume_aug, affine_grid,
-                    mode='bilinear', padding_mode='border')
-            else:
-                target_volume_aug = target_volume
-                target_proj_aug = target_proj
+            source_aug = source
+            target_volume_aug = target_volume
+            target_proj_aug = target_proj
+            source_aug = self._augment_3d_intensity(source_aug)
+            density = self._augment_3d_intensity(density)
+            target_proj_aug, aug_tag = self._augment_2d_projs_shared(target_proj_aug)
         else:
             source_aug = source
             target_volume_aug = target_volume

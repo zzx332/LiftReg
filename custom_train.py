@@ -114,6 +114,8 @@ if __name__ == '__main__':
                         default=None,help='path of the folder where settings are saved,should include cur_task_setting.json')
     parser.add_argument('--continue_from',required=False, type=str,
                         help='Which checkpoint we should continue train from')             
+    parser.add_argument('--save_path',required=False, type=str,
+                        help='Save path for the output')             
     parser.add_argument('-g',"--gpu_id",required=False,type=int,default=0,help='gpu_id to use')
     parser.add_argument('--test_forward', action='store_true',
                         help='Perform a forward pass check once before training; disabled by default to avoid additional memory spikes.')
@@ -140,12 +142,13 @@ if __name__ == '__main__':
     
     # 测试
     if args.test_forward:
-        _ = trainer.test_forward()
+        save_path = args.save_path if args.save_path is not None else None
+        _ = trainer.test_forward(save_path=save_path)
         del _
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-    
-    # 开始训练
-    trainer.train()
+    else:   
+        # 开始训练
+        trainer.train()
 
 

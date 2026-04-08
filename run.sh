@@ -1,1 +1,1 @@
-python custom_train.py -o "/home/zzx/data/exp_liftreg" -d "/home/zzx/extracted_data_shift_only3" -v "/home/zzx/data/data/test_shift_only1" -e "3d_bn_aug" -s "./" -g 0
+python custom_train.py -o "/home/zzx/data/exp_liftreg" -d "/home/zzx/extracted_data_shift_only3" -v "/home/zzx/data/data/test_shift_only_06" -e "3d_bn_aug" -s "./" -g 0

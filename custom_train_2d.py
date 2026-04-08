@@ -150,7 +150,7 @@ class RegTrainer2D:
         print(f"Validation Loss: {avg_val_loss:.4f}")
     
     def save_output(self, input, output, save_path, identifier):
-        make_dir(os.path.dirname(save_path))
+        make_dir(save_path)
         import SimpleITK as sitk
         def save_tensor_arr(tensor_arr, path):
             sitk.WriteImage(sitk.GetImageFromArray(tensor_arr[:,0].detach().cpu().numpy()), path)

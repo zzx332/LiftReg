@@ -1,9 +1,9 @@
 {
     "dataset": {
         "apply_hu_clip": true,
-        "data_path": "/home/zzx/extracted_data_shift_only3",
-        "val_data_path": "/home/zzx/data/data/test_shift_only_06",
-        "dataset_class": "liftreg.dataset.FluoroDataset2D.FluoroDataset2D",
+        "data_path": "/home/zzx/data/deepfluoro/deepfluoro_train",
+        "val_data_path": "/home/zzx/data/deepfluoro/deepfluoro_val",
+        "dataset_class": "liftreg.dataset.FluoroDatasetXray2D.FluoroDatasetXray2D",
         "drr_folder_name": "diffdrr",
         "img_after_resize": [160, 160],
         "load_projection_interval": 1,
@@ -12,7 +12,7 @@
         "spacing_to_refer": [2.2, 2.2, 2.2],
         "use_segmentation_map": true,
         "augmentation_enable": true,
-        "offline_aug_variants": 4,
+        "offline_aug_variants": 0,
         "aug_noise_prob": 0.5,
         "aug_affine_prob": 0.3,
         "aug_rotate_deg": 2.0,
@@ -26,7 +26,7 @@
         "dataloader": {
             "batch_size": 2,
             "shuffle": [true, true, false, false],
-            "workers": [1, 1, 0, 0]
+            "workers": [4, 4, 0, 0]
         },
         "debug_on": true,
         "memory_profile": true,

@@ -15,11 +15,11 @@ from diffdrr.renderers import Siddon
 from polypose.weights import compute_weights
 from torch.utils.data import Dataset
 from torchio import LabelMap, ScalarImage, Subject
-
+from xvr.dicom import read_xray
 from liftreg.dataset.FluoroDataset import Warp
 
 
-class FluoroDataset2D(Dataset):
+class FluoroDatasetXray2D(Dataset):
     """
     2D DRR + 2D X-ray registration dataset.
 
@@ -33,10 +33,10 @@ class FluoroDataset2D(Dataset):
 
     def __init__(self, data_path, phase=None, transform=None, option=None):
         self.data_path = data_path
-        self.org_data_path = "/home/zzx/data/deepfluoro"
-        self.drr_path = os.path.join(data_path, "drr")
+        # self.org_data_path = "/home/zzx/data/deepfluoro"
+        # self.xray_path = os.path.join(data_path, "xrays")
         self.warp_path = os.path.join(data_path, "warp_pose")
-        self.cache_dir = os.path.join(data_path, "preprocessed_2d")
+        self.cache_dir = os.path.join(data_path, "preprocessed_xray2d")
         os.makedirs(self.cache_dir, exist_ok=True)
 
         self.phase = phase
@@ -74,13 +74,17 @@ class FluoroDataset2D(Dataset):
         self.detector_width = option[("detector_width", 384, "")]
 
         self.meta_list = []
+        self.identifier_list = []
         self.get_identifier_list()
         self.init_img_pool()
 
     def get_identifier_list(self):
-        self.identifier_list = [
-            i[:-7] for i in os.listdir(self.drr_path) if i.endswith(".nii.gz")
-        ]
+        for subject_id in os.listdir(self.data_path):
+            if "subject" not in subject_id:
+                continue
+            for file in os.listdir(os.path.join(self.data_path, subject_id, "xrays")):
+                if file.endswith(".dcm"):
+                    self.identifier_list.append(subject_id + "_" + file[:-4])
         if self.max_num_for_loading > 0:
             self.identifier_list = self.identifier_list[:self.max_num_for_loading]
 
@@ -110,13 +114,14 @@ class FluoroDataset2D(Dataset):
         return self._siddon(density, src, tgt, img_input).view(
             1, -1, self._detector.height, self._detector.width)
 
-    def _load_dataset(self, subject_id):
-        datapath = Path(os.path.join(self.org_data_path, subject_id))
+    def _load_dataset(self, subject_id, idx):
+        datapath = Path(os.path.join(self.data_path, subject_id))
         volume = datapath / "volume.nii.gz"
         mask = datapath / "mask.nii.gz"
         xrays = datapath / "xrays"
-        segs = datapath / "segmentations"
-        return volume, mask, xrays, segs
+        xray, *_ = read_xray(f"{xrays}/{idx:03d}.dcm", crop=100)
+        pose, *_ = torch.load(f"{xrays}/{idx:03d}.pt", weights_only=False)["pose"][::self.load_projection_interval]
+        return volume, mask, xray, pose
 
     def _load_warp_pose(self, identifier):
         rot_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt')
@@ -191,7 +196,8 @@ class FluoroDataset2D(Dataset):
         if self.offline_aug_variants <= 0 or source_seg is None or weights is None:
             return None
 
-        pose_cache = self._load_warp_pose(identifier)
+        poses_rot = torch.randn(3, 3) * 0.05
+        poses_xyz = torch.randn(3, 3) * 5.0
         aug_source_proj = []
         aug_target_proj = []
         aug_affines = []
@@ -206,8 +212,8 @@ class FluoroDataset2D(Dataset):
                 density_aug,
                 source_seg_aug,
                 weights_aug,
-                pose_cache["poses_rot"],
-                pose_cache["poses_xyz"],
+                poses_rot,
+                poses_xyz,
                 affine_aug,
             )
             warped_density, _, _ = warp()
@@ -246,7 +252,7 @@ class FluoroDataset2D(Dataset):
             return
 
         self._init_projector_if_needed()
-        volume, mask, xrays, segs = self._load_dataset(identifier.split("_")[0])
+        volume, mask, xray, target_poses = self._load_dataset(identifier.split("_")[0], int(identifier.split("_")[1]))
 
         source_img = ScalarImage(volume)
         source_seg = LabelMap(mask)
@@ -278,15 +284,7 @@ class FluoroDataset2D(Dataset):
 
         affine = torch.as_tensor(source_img.affine, dtype=torch.float32)
 
-        target_poses, *_ = torch.load(
-            os.path.join(self.drr_path, identifier.split("_")[0] + "_pose.pt"),
-            weights_only=False,
-        )["pose"][::self.load_projection_interval]
-
-        target_proj_t = sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(self.drr_path, identifier + ".nii.gz")))
-        target_proj_t = np.transpose(target_proj_t, (0, 2, 1))
-        target_proj_np = self._prepare_projection_stack(target_proj_t.astype(np.float32))
-
+        target_proj_np = self._prepare_projection_stack(xray.squeeze(0).numpy().astype(np.float32))
         source_proj_t = self._run_renderer(density_t.squeeze(0), target_poses, affine.inverse())
         source_proj_np = self._prepare_projection_stack(
             source_proj_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
@@ -562,7 +560,6 @@ class FluoroDataset2D(Dataset):
             p01 = np.clip((p - p_min) / p_range, 0.0, 1.0).astype(np.float32)
             metas.append((p_min, p_max, p_range))
             p01_list.append(p01)
-
         if choice == 0:
             # lam = float(np.random.uniform(300.0, 1000.0))
             lam = float(np.random.uniform(2000.0, 5000.0))
