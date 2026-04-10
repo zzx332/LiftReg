@@ -105,6 +105,104 @@ class FluoroDatasetXray2D(Dataset):
                 n_subsample=None,
             )
 
+    def _render_majority_label_vectorized(
+        self,
+        mask: torch.Tensor,
+        target_poses,
+        affine_inv,
+        max_samples: int = 1024,
+        num_labels: int | None = None,
+    ) -> torch.Tensor:
+        """
+        沿每条射线采样，返回“出现次数最多”的非零标签（多数投票）。
+        mask: (D,H,W) or (B,D,H,W) or (B,1,D,H,W), 标签值 0..K，0 为背景
+        source/target: (B,N,3) 世界坐标（会在函数内转体素）
+        affine_inv: RigidTransform(affine.inverse())
+        return: (B,N) 每条射线的 majority 非零标签；若全背景则返回 0
+        """
+        import torch.nn.functional as F
+
+        # 0) 统一 mask 形状到 (B,1,D,H,W)
+        if mask.dim() == 3:
+            D, H, W = mask.shape
+            mask_b = mask[None, None]
+        elif mask.dim() == 4:
+            Bm, D, H, W = mask.shape
+            mask_b = mask[:, None]
+        elif mask.dim() == 5:
+            Bm, Cm, D, H, W = mask.shape
+            mask_b = mask[:, :1]
+        else:
+            raise ValueError(f"Unexpected mask shape: {mask.shape}")
+            
+        poses = RigidTransform(target_poses)
+        source, target = self._detector(poses, calibration=None)
+
+        B, N, _ = target.shape
+        if mask_b.shape[0] == 1 and B > 1:
+            mask_b = mask_b.expand(B, -1, -1, -1, -1)
+        elif mask_b.shape[0] != B:
+            raise ValueError(f"mask batch {mask_b.shape[0]} != target batch {B}")
+        # 1) 世界坐标 -> 体素坐标
+        affine_inv = RigidTransform(affine_inv)
+        source_voxel = affine_inv(source)  # (B,N,3)
+        target_voxel = affine_inv(target)  # (B,N,3)
+        ray_dir = source_voxel - target_voxel
+
+        # 2) 沿射线均匀采样 points: (B,N,S,3)
+        t = torch.linspace(0, 1, max_samples, device=mask_b.device, dtype=mask_b.dtype)
+        t = t.view(1, 1, max_samples, 1)
+        points = target_voxel.unsqueeze(2) + t * ray_dir.unsqueeze(2)
+
+        # 3) 体素坐标归一化到 grid_sample 的 [-1,1]
+        # 这里沿用你当前假设：points[...,0/1/2] 对应 D/H/W
+        d = points[..., 0]
+        h = points[..., 1]
+        w = points[..., 2]
+
+
+        d_norm = 2.0 * d / (D - 1) - 1.0
+        h_norm = 2.0 * h / (H - 1) - 1.0
+        w_norm = 2.0 * w / (W - 1) - 1.0
+
+        # grid 最后一维必须是 (x,y,z)=(W,H,D)
+        grid = torch.stack([w_norm, h_norm, d_norm], dim=-1)  # (B,N,S,3)
+        grid = grid.permute(0, 2, 1, 3).contiguous().view(B, max_samples, 1, N, 3)
+
+        # 4) 采样标签： (B,N,S)
+        sampled = F.grid_sample(
+            input=mask_b,
+            grid=grid,
+            mode="nearest",
+            padding_mode="zeros",
+            align_corners=True,
+        )  # (B,1,S,1,N)
+
+        sampled = sampled[:, 0, :, 0, :]            # (B,S,N)
+        sampled = sampled.permute(0, 2, 1).long()   # (B,N,S)
+
+        # 5) 多数投票（忽略背景 0）
+        if num_labels is None:
+            # +1 防止 max=0 时 one_hot 维度为0
+            num_labels = int(sampled.max().item()) + 1
+        num_labels = max(num_labels, 1)
+
+        # one_hot: (B,N,S,C) -> 按 S 求和得到每条射线每个标签出现次数
+        counts = F.one_hot(sampled.clamp(min=0), num_classes=num_labels).sum(dim=2)  # (B,N,C)
+
+        # 忽略背景标签 0
+        if num_labels > 1:
+            counts[..., 0] = 0
+
+        majority = counts.argmax(dim=-1)  # (B,N)
+
+        # 若一条射线全为0，强制返回0
+        has_foreground = (counts.sum(dim=-1) > 0)
+        majority = torch.where(has_foreground, majority, torch.zeros_like(majority))
+
+        return majority.to(mask_b.dtype).view(
+            1, -1, self._detector.height, self._detector.width)
+        
     def _run_renderer(self, density, target_poses, affine_inverse):
         poses = RigidTransform(target_poses)
         src, tgt = self._detector(poses, calibration=None)
@@ -189,7 +287,8 @@ class FluoroDatasetXray2D(Dataset):
         )
 
     def _prepare_label_projection_stack(self, proj):
-        proj = (np.ascontiguousarray(proj.astype(np.float32)) > 0.1).astype(np.float32)
+        proj[proj==7] = 0
+        proj = (np.ascontiguousarray(proj.astype(np.float32)).astype(np.float32))
         return np.ascontiguousarray(self._resize_projection_stack(proj, mode="nearest"))
 
     def _build_offline_augmented_bank(self, identifier, density, source_seg, weights, affine, target_poses):
@@ -292,7 +391,8 @@ class FluoroDatasetXray2D(Dataset):
 
         if self.has_label and source_seg is not None:
             seg_density = source_seg.data.squeeze(0).to(torch.float32)
-            source_seg_proj_t = self._run_renderer(seg_density, target_poses, affine.inverse())
+            # source_seg_proj_t = self._run_renderer(seg_density, target_poses, affine.inverse())
+            source_seg_proj_t = self._render_majority_label_vectorized(seg_density, target_poses, affine.inverse(), max_samples=1024)
             source_seg_proj_np = self._prepare_label_projection_stack(
                 source_seg_proj_t.squeeze(0).detach().cpu().numpy().astype(np.float32)
             )

@@ -153,11 +153,16 @@ class RegTrainer2D:
         make_dir(save_path)
         import SimpleITK as sitk
         def save_tensor_arr(tensor_arr, path):
-            sitk.WriteImage(sitk.GetImageFromArray(tensor_arr[:,0].detach().cpu().numpy()), path)
-        save_name = f"{identifier[0]}_{identifier[1].split('.')[0][-2:]}"
-        save_tensor_arr(input['source_proj'], os.path.join(save_path, f"{save_name}_moving.nii.gz"))
-        save_tensor_arr(output['target_proj'], os.path.join(save_path, f"{save_name}_fixed.nii.gz"))
-        save_tensor_arr(output['warped_moving'], os.path.join(save_path, f"{save_name}_warped.nii.gz"))
+            sitk.WriteImage(sitk.GetImageFromArray(tensor_arr.detach().cpu().numpy()), path)
+        for i, case in enumerate(identifier):
+            flow = output['phi']
+            source_seg = input['source_label']
+            warped_seg = self.model.transformer(source_seg.float(), flow, mode="nearest")
+            save_tensor_arr(input['source_proj'][i], os.path.join(save_path, f"{case}_source.nii.gz"))
+            save_tensor_arr(input['source_label'][i], os.path.join(save_path, f"{case}_source_seg.nii.gz"))
+            save_tensor_arr(output['target_proj'][i], os.path.join(save_path, f"{case}_fixed.nii.gz"))
+            save_tensor_arr(output['warped_moving'][i], os.path.join(save_path, f"{case}_warped.nii.gz"))
+            save_tensor_arr(warped_seg[i], os.path.join(save_path, f"{case}_warped_seg.nii.gz"))
 
     def _load_checkpoint(self, ckpt_path):
         if not os.path.isfile(ckpt_path):

@@ -5,7 +5,7 @@
         "val_data_path": "/home/zzx/data/data/test_shift_only_06",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
-        "augmentation_enable": false,
+        "augmentation_enable": true,
         "aug_affine_prob": 0.3,
         "aug_rotate_deg": 2.0,
         "aug_translate_vox": 4.0,
@@ -39,7 +39,7 @@
     "train": {
         "check_best_model_frequency": 1,
         "dataloader": {
-            "batch_size": 1,
+            "batch_size": 2,
             "shuffle": [
                 true,
                 true,
@@ -74,7 +74,7 @@
             "latent_dim": 56,
             "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca",
             "use_pca": false,
-            "use_polyrigid": true,
+            "use_polyrigid": false,
             "num_segments": 3
         },
         "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model",

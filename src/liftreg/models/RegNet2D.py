@@ -6,9 +6,8 @@ class SpatialTransformer(nn.Module):
     """
     2D Spatial Transformer Network
     """
-    def __init__(self, size, mode='bilinear'):
+    def __init__(self, size):
         super().__init__()
-        self.mode = mode
         # Create sampling grid
         vectors = [torch.arange(0, s) for s in size]
         grids = torch.meshgrid(vectors, indexing='ij')
@@ -17,7 +16,7 @@ class SpatialTransformer(nn.Module):
         grid = grid.type(torch.FloatTensor)
         self.register_buffer('grid', grid)
 
-    def forward(self, src, flow):
+    def forward(self, src, flow, mode="bilinear"):
         # new locations
         new_locs = self.grid + flow
         shape = flow.shape[2:]
@@ -32,7 +31,7 @@ class SpatialTransformer(nn.Module):
             # new_locs = new_locs[..., [1, 0]]  # x, y format for grid_sample
             new_locs = torch.stack((new_locs[..., 1], new_locs[..., 0]), dim=-1)
 
-        return F.grid_sample(src, new_locs, align_corners=True, mode=self.mode)
+        return F.grid_sample(src, new_locs, align_corners=True, mode=mode)
 
 
 class ConvBlock(nn.Module):
