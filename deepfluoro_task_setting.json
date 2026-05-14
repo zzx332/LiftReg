@@ -3,6 +3,7 @@
         "apply_hu_clip": true,
         "data_path": "/home/zzx/data/extracted_data_shift_only3",
         "val_data_path": "/home/zzx/data/data/test_shift_only_06",
+        "test_data_path": "/home/zzx/data/data/test_shift_only_06",
         "dataset_class": "liftreg.dataset.FluoroDataset.FluoroDataset",
         "drr_folder_name": "diffdrr",
         "augmentation_enable": true,
@@ -34,12 +35,12 @@
             2.2
         ],
         "use_segmentation_map": true,
-        "supervise": false
+        "supervise": true
     },
     "train": {
         "check_best_model_frequency": 1,
         "dataloader": {
-            "batch_size": 2,
+            "batch_size": 1,
             "shuffle": [
                 true,
                 true,
@@ -67,7 +68,7 @@
             "disp_factor": 0.1
         },
         "loss_class": "liftreg.losses.Subspace2DLoss.loss",
-        "mode": "train",
+        "mode": "test",
         "continue_from": null,
         "model": {
             "drr_feature_num": 1,

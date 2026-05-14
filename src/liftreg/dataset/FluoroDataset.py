@@ -327,8 +327,8 @@ class FluoroDataset(Dataset):
         """Preprocess one CT/pose pair and save results to disk."""
         npz_path  = os.path.join(self.cache_dir, f'{identifier}.npz')
         meta_path = os.path.join(self.cache_dir, f'{identifier}_meta.pt')
-        if self._cache_is_valid(npz_path, meta_path):
-            return  # already cached
+        # if self._cache_is_valid(npz_path, meta_path):
+        #     return  # already cached
 
         self._init_projector_if_needed()
         # ---- 1. Load & preprocess CT volume ----

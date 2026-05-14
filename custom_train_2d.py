@@ -35,6 +35,7 @@ class RegTrainer2D:
         self.output_path = train_setting['output_path']
         self.log_path = os.path.join(self.output_path, "logs")
         self.epochs = train_setting['epoch', 1000]
+        self.steps_per_epoch = int(train_setting['steps_per_epoch', 500])
         self.val_frequency = train_setting['val_frequency', 20]
         
         # Data
@@ -59,9 +60,13 @@ class RegTrainer2D:
 
         # Continue training from checkpoint if requested
         self.continue_train = train_setting['continue_train', False]
+        self.test_forward = train_setting['test_forward', False]
         self.continue_from = train_setting['continue_from', '']
+        self.test_from = train_setting['test_from', '']
         if self.continue_train and len(self.continue_from) > 0:
             self._load_checkpoint(self.continue_from)
+        if self.test_forward and len(self.test_from) > 0:
+            self._load_checkpoint(self.test_from)
 
     def set_input(self, batch):
         ret = {}
@@ -85,35 +90,46 @@ class RegTrainer2D:
 
     def train(self):
         print(f"Starting 2D Training for {self.epochs} epochs.")
+        train_iter = iter(self.train_loader)
         for epoch in range(self.start_epoch, self.epochs + 1):
             self.model.train()
             epoch_loss = 0.0
-            sim_loss_epoch = 0.05
+            sim_loss_epoch = 0.0
             reg_loss_epoch = 0.0
-            
-            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch}/{self.epochs}")
-            for batch, _ in pbar:
+
+            pbar = tqdm(
+                range(self.steps_per_epoch),
+                desc=f"Epoch {epoch}/{self.epochs}",
+            )
+            for _ in pbar:
+                try:
+                    batch, _ = next(train_iter)
+                except StopIteration:
+                    train_iter = iter(self.train_loader)
+                    batch, _ = next(train_iter)
+
                 batch = self.set_input(batch)
                 self.optimizer.zero_grad()
-                
+
                 output = self.model(batch)
                 losses = self.loss(output)
-                
+
                 loss_val = losses['total_loss']
                 loss_val.backward()
                 self.optimizer.step()
-                
+
                 epoch_loss += loss_val.item()
                 sim_loss_epoch += losses['sim_loss'].item()
                 reg_loss_epoch += losses['reg_loss'].item()
-                
+
                 pbar.set_postfix({'loss': loss_val.item()})
-                
-            n_batches = len(self.train_loader)
-            avg_loss = epoch_loss / n_batches
-            avg_sim = sim_loss_epoch / n_batches
-            avg_reg = reg_loss_epoch / n_batches
-            
+            print(f"max displacement: {output['phi'].max().item():.4f}")
+            print(f"min displacement: {output['phi'].min().item():.4f}")
+            n_steps = self.steps_per_epoch
+            avg_loss = epoch_loss / n_steps
+            avg_sim = sim_loss_epoch / n_steps
+            avg_reg = reg_loss_epoch / n_steps
+
             self.writer.add_scalar("Train/Total_Loss", avg_loss, epoch)
             self.writer.add_scalar("Train/Sim_Loss", avg_sim, epoch)
             self.writer.add_scalar("Train/Reg_Loss", avg_reg, epoch)
@@ -156,13 +172,14 @@ class RegTrainer2D:
             sitk.WriteImage(sitk.GetImageFromArray(tensor_arr.detach().cpu().numpy()), path)
         for i, case in enumerate(identifier):
             flow = output['phi']
-            source_seg = input['source_label']
-            warped_seg = self.model.transformer(source_seg.float(), flow, mode="nearest")
             save_tensor_arr(input['source_proj'][i], os.path.join(save_path, f"{case}_source.nii.gz"))
-            save_tensor_arr(input['source_label'][i], os.path.join(save_path, f"{case}_source_seg.nii.gz"))
             save_tensor_arr(output['target_proj'][i], os.path.join(save_path, f"{case}_fixed.nii.gz"))
             save_tensor_arr(output['warped_moving'][i], os.path.join(save_path, f"{case}_warped.nii.gz"))
-            save_tensor_arr(warped_seg[i], os.path.join(save_path, f"{case}_warped_seg.nii.gz"))
+            if 'source_label' in input:
+                source_seg = input['source_label'][i]
+                warped_seg = self.model.transformer(source_seg.float(), flow, mode="nearest")
+                save_tensor_arr(input['source_label'][i], os.path.join(save_path, f"{case}_source_seg.nii.gz"))
+                save_tensor_arr(warped_seg[i], os.path.join(save_path, f"{case}_warped_seg.nii.gz"))
 
     def _load_checkpoint(self, ckpt_path):
         if not os.path.isfile(ckpt_path):
@@ -189,12 +206,17 @@ if __name__ == '__main__':
     parser.add_argument('--continue_from', required=False, type=str, default=None, help='Path to checkpoint for continue training')
     parser.add_argument('--save_path', required=False, type=str, default=None, help='Path to save the output')
     parser.add_argument('--test', action='store_true', help='Test the model')
+    parser.add_argument('--test_from',required=False, type=str,
+                        help='The path to the checkpoint for testing')
     args = parser.parse_args()
 
     set_seed_for_demo()
     
     setting = pars.ParameterDict()
     setting.load_JSON(args.setting_path)
+    if args.test_from is not None:
+        setting["train"]["test_forward"] = True
+        setting["train"]["test_from"] = args.test_from
     if args.continue_from is not None:
         setting["train"]["continue_train"] = True
         setting["train"]["continue_from"] = args.continue_from

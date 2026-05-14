@@ -26,10 +26,12 @@ def prepare(args):
     exp_name = args.exp_name
     data_path = args.data_path
     val_data_path = args.val_data_path
+    test_data_path = args.test_data_path
     setting_path = args.setting_path
     continue_from = args.continue_from
     gpu_id = args.gpu_id
-
+    mode = "test" if args.test_forward else None
+    test_from = args.test_from
     dataset_name = data_path.split('/')[-1]
 
     # Create experiment folder
@@ -59,9 +61,12 @@ def prepare(args):
     # Update setting file with command input
     setting["dataset"]["data_path"] = data_path if data_path is not None else setting["dataset"]["data_path"]
     setting["dataset"]["val_data_path"] = val_data_path if val_data_path is not None else setting["dataset"]["val_data_path"]
+    setting["dataset"]["test_data_path"] = test_data_path if test_data_path is not None else setting["dataset"]["test_data_path"]
     setting["train"]["output_path"] = exp_folder_path if exp_folder_path is not None else setting["train"]["output_path"]
     setting["train"]["gpu_ids"] = gpu_id if gpu_id is not None else setting["train"]["gpu_ids"]
     setting["train"]["continue_from"] = continue_from if continue_from is not None else setting["train"]["continue_from"]
+    setting["train"]["test_from"] = test_from if test_from is not None else setting["train"]["test_from"]
+    setting["train"]["mode"] = mode if mode is not None else setting["train"]["mode"]
     # Write the commit hash for current codebase
     label = get_git_revisions_hash()
     setting["exp"]["git_commit"] = label
@@ -113,7 +118,11 @@ if __name__ == '__main__':
     parser.add_argument('-s','--setting_path', required=True, type=str,
                         default=None,help='path of the folder where settings are saved,should include cur_task_setting.json')
     parser.add_argument('--continue_from',required=False, type=str,
-                        help='Which checkpoint we should continue train from')             
+                        help='Which checkpoint we should continue train from')
+    parser.add_argument('--test_data_path',required=False, type=str,
+                        help='The path to the test data folder')
+    parser.add_argument('--test_from',required=False, type=str,
+                        help='The path to the test checkpoint')
     parser.add_argument('--save_path',required=False, type=str,
                         help='Save path for the output')             
     parser.add_argument('-g',"--gpu_id",required=False,type=int,default=0,help='gpu_id to use')

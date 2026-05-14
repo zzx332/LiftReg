@@ -85,8 +85,12 @@ class NCC2D(nn.Module):
         cross = IJ_sum - u_J * I_sum - u_I * J_sum + u_I * u_J * win_size
         I_var = I2_sum - 2 * u_I * I_sum + u_I * u_I * win_size
         J_var = J2_sum - 2 * u_J * J_sum + u_J * u_J * win_size
-
-        cc = cross * cross / (I_var * J_var + 1e-5)
+        # 数值稳定性增强
+        I_var = I_var.clamp_min(0.0)  # 方差不应为负
+        J_var = J_var.clamp_min(0.0)
+        
+        denom = (I_var * J_var).clamp_min(1e-5)  # 确保分母 >= 1e-5
+        cc = cross * cross / denom
 
         return -torch.mean(cc)
         

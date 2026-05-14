@@ -36,6 +36,7 @@ class regUNetTrainer:
         # Init dataset and dataloader
         data_path = dataset_setting["data_path"]
         val_data_path = dataset_setting["val_data_path"]
+        test_data_path = dataset_setting["test_data_path"]
         batch_size = train_setting["dataloader"]["batch_size"]
         shuffle = train_setting["dataloader"]["shuffle"]
         workers = train_setting["dataloader"]["workers"]
@@ -61,7 +62,7 @@ class regUNetTrainer:
                             #                    shuffle=shuffle[2],
                             #                    num_workers=workers[2])}
         elif self.mode == "test":
-            self.dataset = {'test': dataset_class(data_path, phase="test",
+            self.dataset = {'test': dataset_class(test_data_path, phase="test",
                                                   option=dataset_setting)}
             self.dataloaders = {"test": DataLoader(self.dataset["test"],
                                                    batch_size=batch_size,
@@ -360,7 +361,7 @@ class regUNetTrainer:
         prefix_name = '_'.join([identifier[i].split('.')[0][-2:] for i in range(B)])
         save_name = f"{identifier[0].split('_')[0]}_{prefix_name}"
         moving_projs = []
-        density = batch['source'].to(self.device)
+        density = batch['density'].to(self.device)
         target_poses = batch['target_poses'].to(self.device)
         affine_inverse = batch['affine'].inverse().to(self.device)
         for b in range(B):
@@ -380,7 +381,7 @@ class regUNetTrainer:
     def test_forward(self, save_path=None):
         """测试前向传播"""
         print("\n测试前向传播...")
-        test_iter = iter(self.dataloaders['val'])
+        test_iter = iter(self.dataloaders['test'])
         self.model.eval()
         for i in range(10):
             data = next(test_iter)
