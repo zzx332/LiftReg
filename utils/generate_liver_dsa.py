@@ -6,11 +6,12 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import SimpleITK as sitk
 import torch
+import torch.nn.functional as F
 import torchio
 from diffdrr.detector import Detector
 from diffdrr.pose import RigidTransform
 from diffdrr.renderers import Siddon
-from torchio import ScalarImage
+from torchio import LabelMap, ScalarImage
 from scipy.spatial.transform import Rotation
 
 DATA_PATH = "/home/zzx/data/pair_CT_DSA_10"
@@ -77,8 +78,8 @@ def transform_hu_to_density(volume: torch.Tensor, bone_attenuation_multiplier: f
     """Same HU->density rule used in FluoroDataset."""
     volume = volume.to(torch.float32)
     density = torch.empty_like(volume)
-    air_threshold = -800
-    # air_threshold = 0
+    # air_threshold = -800
+    air_threshold = 0
     soft_tissue_threshold = 350
     bone_threshold = 1200
     soft_tissue = torch.where((air_threshold < volume) & (volume <= soft_tissue_threshold))
@@ -114,6 +115,39 @@ def load_and_preprocess_ct(ct_mhd_path: str, case_name: str) -> Tuple[torch.Tens
     density_xyz = density.squeeze(0).to(torch.float32).cpu()
     affine = torch.as_tensor(source_img.affine, dtype=torch.float32)
     return density_xyz, affine.inverse()
+
+
+def load_ct_and_mask(
+    ct_mhd_path: str,
+    seg_path: Optional[str],
+    case_name: str,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
+    """
+    Load CT and (optional) segmentation, applying the same canonicalize so they
+    share the world-to-voxel affine.
+
+    Returns:
+        density_xyz: (X, Y, Z) float32 tensor
+        mask_xyz:    (X, Y, Z) int16 tensor or None
+        affine_inv:  (4, 4) float32 tensor
+    """
+    source_img = ScalarImage(ct_mhd_path)
+    source_img.data = source_img.data - 1024.0
+    source_img.data[torch.where(source_img.data > 2048)] = 2048
+    source_img = canonicalize(source_img, case_name)
+    canonical_affine = np.array(source_img.affine, dtype=np.float64).copy()
+
+    density = transform_hu_to_density(source_img.data, bone_attenuation_multiplier=1.0)
+    density_xyz = density.squeeze(0).to(torch.float32).cpu()
+    affine_inv = torch.as_tensor(canonical_affine, dtype=torch.float32).inverse()
+
+    mask_xyz: Optional[torch.Tensor] = None
+    if seg_path is not None and os.path.isfile(seg_path):
+        seg_img = LabelMap(seg_path)
+        # CT and seg share identical raw geometry; reuse canonical affine directly.
+        seg_img = LabelMap(tensor=seg_img.data, affine=canonical_affine)
+        mask_xyz = seg_img.data.squeeze(0).to(torch.int16).cpu()
+    return density_xyz, mask_xyz, affine_inv
 
 
 def make_renderer(
@@ -156,6 +190,75 @@ def render_drr(
     return proj.detach().cpu()
 
 
+def render_mask_first_hit(
+    mask_xyz: torch.Tensor,
+    extrinsic: torch.Tensor,
+    affine_inv: torch.Tensor,
+    detector: Detector,
+    max_samples: int = 256,
+) -> torch.Tensor:
+    """
+    Render a first-hit (first non-zero label along each ray) projection of a
+    multi-label mask, sharing geometry with `render_drr`.
+
+    Args:
+        mask_xyz:   (X, Y, Z) integer-valued label volume in CT voxel order.
+        extrinsic:  (4, 4) cam->world pose (same as `render_drr`).
+        affine_inv: (4, 4) world->voxel affine (same as `render_drr`).
+        detector:   diffdrr Detector instance.
+        max_samples: number of samples along each ray.
+
+    Returns:
+        (1, H, W) int16 tensor with first-hit label values (0 where empty).
+    """
+    pose = RigidTransform(extrinsic.unsqueeze(0).to(torch.float32))
+    src, tgt = detector(pose, calibration=None)  # world coords, (1, N, 3)
+    src_v = RigidTransform(affine_inv)(src)       # voxel coords
+    tgt_v = RigidTransform(affine_inv)(tgt)
+
+    # mask: (X,Y,Z) -> (1,1,Z,Y,X) so that grid_sample's (x,y,z) <-> (W=X, H=Y, D=Z)
+    Xs, Ys, Zs = int(mask_xyz.shape[0]), int(mask_xyz.shape[1]), int(mask_xyz.shape[2])
+    mask_5d = mask_xyz.to(torch.float32).permute(2, 1, 0)[None, None]
+
+    B, N, _ = tgt_v.shape  # B=1, N = detector.height * detector.width
+    ray_dir = src_v - tgt_v  # (B, N, 3)
+
+    t = torch.linspace(0.0, 1.0, max_samples, device=mask_5d.device, dtype=mask_5d.dtype)
+    t = t.view(1, 1, max_samples, 1)
+    points = tgt_v.unsqueeze(2) + t * ray_dir.unsqueeze(2)  # (B, N, S, 3) voxel xyz
+
+    x = points[..., 0]
+    y = points[..., 1]
+    z = points[..., 2]
+    x_norm = 2.0 * x / max(Xs - 1, 1) - 1.0
+    y_norm = 2.0 * y / max(Ys - 1, 1) - 1.0
+    z_norm = 2.0 * z / max(Zs - 1, 1) - 1.0
+    grid = torch.stack([x_norm, y_norm, z_norm], dim=-1)  # (B, N, S, 3)
+    grid = grid.permute(0, 2, 1, 3).contiguous().view(B, max_samples, 1, N, 3)
+
+    sampled = F.grid_sample(
+        input=mask_5d,
+        grid=grid,
+        mode="nearest",
+        padding_mode="zeros",
+        align_corners=True,
+    )  # (B, 1, S, 1, N)
+    sampled = sampled[:, 0, :, 0, :].permute(0, 2, 1).contiguous()  # (B, N, S)
+
+    nonzero = sampled != 0
+    idx = torch.arange(max_samples, device=sampled.device).view(1, 1, max_samples)
+    INF = max_samples + 1
+    idx_masked = torch.where(nonzero, idx, torch.full_like(idx, INF))
+    first_idx = idx_masked.min(dim=2).values  # (B, N)
+
+    first_idx_clamped = first_idx.clamp(0, max_samples - 1).unsqueeze(2)
+    first_label = torch.gather(sampled, 2, first_idx_clamped).squeeze(2)
+    first_label = torch.where(first_idx < INF, first_label, torch.zeros_like(first_label))
+
+    out = first_label.round().to(torch.int16).view(1, detector.height, detector.width)
+    return out.detach().cpu()
+
+
 def find_first_ct_mhd(case_dir: str) -> Optional[str]:
     ct_dir = os.path.join(case_dir, "CT")
     if not os.path.isdir(ct_dir):
@@ -165,6 +268,19 @@ def find_first_ct_mhd(case_dir: str) -> Optional[str]:
     if len(mhd_files) == 0:
         return None
     return str(mhd_files[0])
+
+
+def find_seg_nii(case_dir: str) -> Optional[str]:
+    """Return path to <case>/Segmentation/seg.nii.gz if it exists."""
+    seg_path = os.path.join(case_dir, "Segmentation", "vertebrae.nii.gz")
+    if os.path.isfile(seg_path):
+        return seg_path
+    seg_dir = os.path.join(case_dir, "Segmentation")
+    if os.path.isdir(seg_dir):
+        candidates = sorted(Path(seg_dir).glob("**/seg.nii.gz"))
+        if candidates:
+            return str(candidates[0])
+    return None
 
 
 def sanitize_name(path_str: str) -> str:
@@ -241,11 +357,13 @@ def main() -> None:
     records: List[Dict] = collect_dsa_records_from_cases(DATA_PATH)
     generated_index: List[Dict] = []
     skipped: List[Dict] = []
-    ct_cache: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+    ct_cache: Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]] = {}
 
     # Reuse detector/siddon for same geometry tuple.
     projector_cache: Dict[Tuple[float, int, int, float, float], Tuple[Siddon, Detector]] = {}
-    dsa_path = "/home/zzx/data/tips_drr/train"
+    output_path = "/home/zzx/data/tips_drr_org"
+    os.makedirs(output_path, exist_ok=True)
+    dsa_path = "/home/zzx/data/tips_drr/val"
     for rec in records:
         case_name = rec.get("case_name")
         if case_name != "shenlixin":
@@ -277,10 +395,11 @@ def main() -> None:
             skipped.append({"case_name": case_name, "reason": "missing_ct_mhd"})
             continue
 
+        seg_path = find_seg_nii(case_dir)
         if case_name not in ct_cache:
-            density_xyz, affine_inv = load_and_preprocess_ct(ct_mhd_path, case_name)
-            ct_cache[case_name] = (density_xyz, affine_inv)
-        density_xyz, affine_inv = ct_cache[case_name]
+            density_xyz, mask_xyz, affine_inv = load_ct_and_mask(ct_mhd_path, seg_path, case_name)
+            ct_cache[case_name] = (density_xyz, mask_xyz, affine_inv)
+        density_xyz, mask_xyz, affine_inv = ct_cache[case_name]
 
         # geom_key = (float(sdd), int(detector_width), int(detector_height), float(dx), float(dy))
         geom_key = (float(sdd), int(new_detector_width), int(new_detector_height), float(new_dx), float(new_dy))
@@ -319,14 +438,34 @@ def main() -> None:
         # drr_img.CopyInformation(dsa_img)
         drr_img.SetSpacing([new_dx, new_dy])
         # drr_np = drr2fluro(drr_np)
-        sitk.WriteImage(drr_img, os.path.join(dsa_path, case_name + "-DRR.mhd"))
-        sitk.WriteImage(dsa_img, os.path.join(dsa_path, case_name + "-DSA.mhd"))
+        sitk.WriteImage(drr_img, os.path.join(output_path, case_name + "-DRR.mhd"))
+        sitk.WriteImage(dsa_img, os.path.join(output_path, case_name + "-DSA.mhd"))
+
+        mask_out_path: Optional[str] = None
+        unique_labels: List[int] = []
+        if mask_xyz is not None:
+            mask_proj = render_mask_first_hit(
+                mask_xyz, extrinsic_cam2world, affine_inv, detector
+            )  # (1, H, W) int16
+            mask_np = mask_proj.numpy().astype(np.uint8)
+            mask_np = np.flip(mask_np, axis=1)
+            mask_np_2d = mask_np[0]
+            mask_img = sitk.GetImageFromArray(mask_np_2d)
+            mask_img.SetSpacing([new_dx, new_dy])
+            mask_out_path = os.path.join(output_path, case_name + "-vertebrae_mask.mhd")
+            sitk.WriteImage(mask_img, mask_out_path)
+            unique_labels = [int(v) for v in np.unique(mask_np_2d).tolist()]
+        else:
+            skipped.append({"case_name": case_name, "reason": "missing_segmentation"})
 
         generated_index.append({
             "case_name": case_name,
             "ct_mhd_path": ct_mhd_path,
+            "seg_path": seg_path,
             "input_mhd_path": mhd_path,
             # "output_drr_path": save_path,
+            "output_mask_path": mask_out_path,
+            "unique_labels": unique_labels,
             "shape": list(drr_np.shape),
             "min": float(drr_np.min()),
             "max": float(drr_np.max()),
@@ -336,7 +475,7 @@ def main() -> None:
             "detector_height": int(detector_height),
             "sdd": float(sdd),
         })
-        print(f"Generated DRR for {case_name}")
+        print(f"Generated DRR for {case_name}" + ("" if mask_out_path is None else " (+ MASK)"))
         # break
 
     index_path = os.path.join(OUTPUT_DIR, "generated_index.json")

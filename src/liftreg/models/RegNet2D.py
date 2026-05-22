@@ -51,11 +51,25 @@ class ConvBlock(nn.Module):
 class RegNet2D(nn.Module):
     """
     2D Registration Network based on UNet architecture.
+    
+    Args:
+        img_size: Spatial size of the input images (H, W).
+        enc_channels: Tuple of encoder channel sizes.
+        dec_channels: Tuple of decoder channel sizes.
+        use_polyrigid: If True, predict per-segment 2D translations and compose
+            them into a dense displacement field via segmentation blending weights,
+            instead of directly predicting a per-pixel flow field.
+        num_segments: Number of rigid segments for polyrigid mode (ignored when
+            use_polyrigid is False).
     """
-    def __init__(self, img_size=(160, 160), enc_channels=(16, 32, 64, 128), dec_channels=(64, 32, 16, 16)):
+    def __init__(self, img_size=(160, 160), enc_channels=(16, 32, 64, 128),
+                 dec_channels=(64, 32, 16, 16), use_polyrigid=False,
+                 num_segments=4):
         super(RegNet2D, self).__init__()
         
         self.img_size = img_size
+        self.use_polyrigid = use_polyrigid
+        self.num_segments = num_segments
 
         # Encoder
         self.enc = nn.ModuleList()
@@ -73,23 +87,31 @@ class RegNet2D(nn.Module):
             if idx < len(dec_channels) - 1:
                 in_ch = out_ch + enc_channels[-(idx+3)] if idx < len(enc_channels) - 2 else out_ch
 
-        # Flow final convolutions
-        self.flow_conv1 = nn.Conv2d(dec_channels[-1], 2, kernel_size=3, padding=1)
-        # Initialize small weights for flow
-        self.flow_conv1.weight.data.normal_(0, 1e-5)
-        self.flow_conv1.bias.data.zero_()
+        # ===== Output head =====
+        if self.use_polyrigid:
+            # Polyrigid head: global pool → FC → per-segment 2D translations
+            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            self.fc_polyrigid = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(dec_channels[-1], 128),
+                nn.ReLU(inplace=True),
+                nn.Linear(128, self.num_segments * 2),  # 2D translation per segment
+            )
+            # Small-weight init so initial displacement is near zero
+            self.fc_polyrigid[-1].weight.data.normal_(mean=0.0, std=0.1)
+            self.fc_polyrigid[-1].bias.data.zero_()
+        else:
+            # Dense flow head
+            self.flow_conv1 = nn.Conv2d(dec_channels[-1], 2, kernel_size=3, padding=1)
+            # Initialize small weights for flow
+            self.flow_conv1.weight.data.normal_(0, 1e-5)
+            self.flow_conv1.bias.data.zero_()
 
         self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
         self.transformer = SpatialTransformer(img_size)
 
-    def forward(self, input_dict):
-        # Expecting inputs as [B, P, H, W] where P=1
-        source = input_dict['source_proj']
-        target = input_dict['target_proj']
-        
-        # Concat inputs
-        x = torch.cat([source, target], dim=1)
-
+    def _estimate_flow(self, x):
+        """Run encoder-decoder and return decoded feature map."""
         # Encoder
         skips = [x]
         for i, enc_block in enumerate(self.enc):
@@ -97,7 +119,7 @@ class RegNet2D(nn.Module):
             skips.append(x)
             if i < len(self.enc) - 1:
                 x = F.max_pool2d(x, 2)
-                
+
         # Decoder
         for i, dec_block in enumerate(self.dec):
             if i < len(self.dec) - 1:
@@ -109,8 +131,54 @@ class RegNet2D(nn.Module):
                 x = torch.cat([x, skip], dim=1)
             x = dec_block(x)
 
+        return x
+
+    @staticmethod
+    def _polyrigid_to_displacement(polyrigid_params, weights):
+        """
+        Pure-translation polyrigid: weighted sum of per-segment 2D translation vectors.
+
+        Each pixel's displacement = sum_k( w_k * t_k ), where t_k is the predicted
+        translation for segment k and w_k is its segmentation weight at that pixel.
+
+        Args:
+            polyrigid_params: (B, K, 2) predicted 2D translation per segment (pixel units)
+            weights:          (B, K, H, W) segmentation blending weights
+
+        Returns:
+            disp_field: (B, 2, H, W) dense pixel-unit displacement field
+        """
+        # weights: (B, K, H, W)   polyrigid_params: (B, K, 2)
+        # result:  (B, 2, H, W)
+        disp_field = torch.einsum("bkhw,bkn->bnhw", weights, polyrigid_params)
+        return disp_field
+
+    def forward(self, input_dict):
+        # Expecting inputs as [B, P, H, W] where P=1
+        source = input_dict['source_proj']
+        target = input_dict['target_proj']
+        
+        # Concat inputs
+        x = torch.cat([source, target], dim=1)
+
+        # Encoder-Decoder
+        features = self._estimate_flow(x)
+
         # Flow prediction
-        flow = self.flow_conv1(x)  # [B, 2, H, W]
+        if self.use_polyrigid:
+            B = source.shape[0]
+            # Predict per-segment 2D translations
+            pooled = self.global_pool(features)
+            raw = self.fc_polyrigid(pooled)                   # (B, K*2)
+            polyrigid_params = raw.view(B, self.num_segments, 2)  # (B, K, 2)
+
+            # Build dense displacement from segmentation weights
+            # Expects input_dict['weights'] of shape (B, K, H, W)
+            seg_weights = input_dict['weights'].to(source.device)
+            flow = self._polyrigid_to_displacement(polyrigid_params, seg_weights)
+        else:
+            polyrigid_params = None
+            flow = self.flow_conv1(features)  # [B, 2, H, W]
 
         # Warp source
         y_source = self.transformer(source, flow)
@@ -120,10 +188,13 @@ class RegNet2D(nn.Module):
             'warped_moving': y_source,  # Warped DRR
             'target_proj': target,      # Ground truth X-ray
         }
+
+        if self.use_polyrigid:
+            output['polyrigid_params'] = polyrigid_params  # (B, K, 2)
         
         # Warp segmentation if provided
         if 'source_label' in input_dict:
-            y_source_label = self.transformer(input_dict['source_label'], flow)
+            y_source_label = self.transformer(input_dict['source_label'].float(), flow, mode='nearest')
             output['warped_label'] = y_source_label
 
         return output

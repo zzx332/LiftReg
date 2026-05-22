@@ -261,9 +261,17 @@ class TipsDataset2D(Dataset):
             mask = binary_erosion(mask, iterations=k)
             return mask
         mask = get_mask(target_proj)
+        if os.path.exists(os.path.join(self.data_path, f"{identifier}-MASK.mhd")):
+            source_mask = sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(self.data_path, f"{identifier}-MASK.mhd")))
+            source_mask = source_mask.astype(np.uint8)
+            source_mask_mask = np.zeros_like(source_mask, dtype=np.float32)
+            source_mask_mask[mask] = source_mask[mask]
+            source_mask = source_mask_mask
+        else:
+            source_mask = None
         source_proj = self._preprocess_xray(source_proj, crop=0, linearize=False, mask=mask)
         target_proj = self._preprocess_xray(target_proj, crop=0, linearize=True, mask=mask)
-        return source_proj, target_proj
+        return source_proj, target_proj, source_mask
 
     def _load_warp_pose(self, identifier):
         rot_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt')
@@ -332,7 +340,6 @@ class TipsDataset2D(Dataset):
         )
 
     def _prepare_label_projection_stack(self, proj):
-        proj[proj==7] = 0
         proj = (np.ascontiguousarray(proj.astype(np.float32)).astype(np.float32))
         return np.ascontiguousarray(self._resize_projection_stack(proj, mode="nearest"))
 
@@ -432,8 +439,12 @@ class TipsDataset2D(Dataset):
             return
 
         self._init_projector_if_needed()
-        source_proj, target_proj = self._load_data(identifier)
+        source_proj, target_proj, source_mask = self._load_data(identifier)
         target_proj_np = self._prepare_projection_stack(target_proj.astype(np.float32))
+        if source_mask is not None:
+            source_mask_np = self._prepare_label_projection_stack(source_mask)
+        else:
+            source_mask_np = None
         source_proj_np = self._prepare_projection_stack(
             source_proj.astype(np.float32)
         )
@@ -443,6 +454,7 @@ class TipsDataset2D(Dataset):
             "source_proj": source_proj_np,
             "target_proj": target_proj_np,
             "spacing": np.array(self.spacing, dtype=np.float32),
+            "source_mask": source_mask_np,
         }
 
         np.savez_compressed(npz_path, **save_dict)
@@ -719,7 +731,7 @@ class TipsDataset2D(Dataset):
             source_proj = np.ascontiguousarray(npz["source_proj"].astype(np.float32))
             target_proj = np.ascontiguousarray(npz["target_proj"].astype(np.float32))
             spacing = np.ascontiguousarray(npz["spacing"].astype(np.float32))
-
+            source_mask = np.ascontiguousarray(npz["source_mask"].astype(np.uint8))
         if self.enable_aug:
             source_proj, target_proj = self._build_offline_augmented_bank(
                 identifier,
@@ -732,12 +744,13 @@ class TipsDataset2D(Dataset):
         sample = {
             "source_proj": source_proj,
             "target_proj": target_proj,
+            "source_label": source_mask,
             "spacing": spacing
         }
 
         if self.transform:
             sample["source_proj"] = self.transform(sample["source_proj"])
-
+            sample["source_label"] = self.transform(sample["source_label"])
         return sample, identifier
 
     def __len__(self):

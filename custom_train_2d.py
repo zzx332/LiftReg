@@ -68,6 +68,9 @@ class RegTrainer2D:
         if self.test_forward and len(self.test_from) > 0:
             self._load_checkpoint(self.test_from)
 
+        # Multi-step registration at validation/inference only (train stays single-step)
+        self.num_refine_steps = int(train_setting['num_refine_steps', 1])
+
     def set_input(self, batch):
         ret = {}
         for k, v in batch.items():
@@ -76,6 +79,47 @@ class RegTrainer2D:
             else:
                 ret[k] = v
         return ret
+
+    def _compose_flow(self, phi_list):
+        """Compose per-step displacement fields: phi_total = phi_0 + warp(phi_1, phi_0) + ..."""
+        phi_total = phi_list[0]
+        for phi_next in phi_list[1:]:
+            phi_warped = self.model.transformer(phi_next, phi_total, mode='bilinear')
+            phi_total = phi_total + phi_warped
+        return phi_total
+
+    def _forward_refine(self, batch):
+        """Iterative inference: each step sees warp(original, phi_so_far); final output uses phi_total."""
+        if self.num_refine_steps <= 1:
+            return self.model(batch)
+
+        original_source = batch['source_proj']
+        current_source = original_source
+        target = batch['target_proj']
+        phi_list = []
+        step_batch = dict(batch)
+        output = None
+        import time
+        time_start = time.time()
+        for step in range(self.num_refine_steps):
+            step_batch['source_proj'] = current_source
+            step_batch['target_proj'] = target
+            output = self.model(step_batch)
+            phi_list.append(output['phi'])
+            if step < self.num_refine_steps - 1:
+                phi_so_far = self._compose_flow(phi_list)
+                current_source = self.model.transformer(original_source, phi_so_far)
+        time_end = time.time()
+        print(f"Time taken for {self.num_refine_steps}-step refinement: {time_end - time_start:.2f} seconds")
+        phi_total = self._compose_flow(phi_list)
+        output = dict(output)
+        output['phi'] = phi_total
+        output['warped_moving'] = self.model.transformer(original_source, phi_total)
+        if 'source_label' in batch:
+            output['warped_label'] = self.model.transformer(
+                batch['source_label'].float(), phi_total, mode='nearest'
+            )
+        return output
 
     def export_pt(self, output_path):
         self.model.eval().to(self.device)
@@ -151,11 +195,13 @@ class RegTrainer2D:
 
     def validate(self, epoch, save_path=None):
         self.model.eval()
+        if self.num_refine_steps > 1:
+            print(f"Validation with {self.num_refine_steps}-step refinement")
         val_loss = 0.0
         with torch.no_grad():
             for batch, identifier in self.val_loader:
                 batch = self.set_input(batch)
-                output = self.model(batch)
+                output = self._forward_refine(batch)
                 if save_path is not None:
                     self.save_output(batch, output, save_path, identifier)
                     continue
@@ -176,10 +222,13 @@ class RegTrainer2D:
             save_tensor_arr(output['target_proj'][i], os.path.join(save_path, f"{case}_fixed.nii.gz"))
             save_tensor_arr(output['warped_moving'][i], os.path.join(save_path, f"{case}_warped.nii.gz"))
             if 'source_label' in input:
-                source_seg = input['source_label'][i]
-                warped_seg = self.model.transformer(source_seg.float(), flow, mode="nearest")
                 save_tensor_arr(input['source_label'][i], os.path.join(save_path, f"{case}_source_seg.nii.gz"))
-                save_tensor_arr(warped_seg[i], os.path.join(save_path, f"{case}_warped_seg.nii.gz"))
+                if 'warped_label' in output:
+                    save_tensor_arr(output['warped_label'][i], os.path.join(save_path, f"{case}_warped_seg.nii.gz"))
+                else:
+                    source_seg = input['source_label'][i].unsqueeze(0).float()
+                    warped_seg = self.model.transformer(source_seg, flow[i:i + 1], mode="nearest")
+                    save_tensor_arr(warped_seg[0], os.path.join(save_path, f"{case}_warped_seg.nii.gz"))
 
     def _load_checkpoint(self, ckpt_path):
         if not os.path.isfile(ckpt_path):
