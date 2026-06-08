@@ -10,7 +10,11 @@
         "load_training_data_into_memory": true,
         "max_num_for_loading": [1000, 20, 10, 10],
         "spacing_to_refer": [2.2, 2.2, 2.2],
-        "use_segmentation_map": false,
+        "use_segmentation_map": true,
+        "provide_weights": true,
+        "num_segments": 3,
+        "label_groups": null,
+        "weightfn": "gravity",
         "augmentation_enable": true,
         "offline_aug_variants": 20,
         "aug_noise_prob": 0.5,
@@ -35,7 +39,7 @@
         "gpu_ids": 0,
         "loss": {
             "sim_factor": 1.0,
-            "reg_factor": 10.0,
+            "reg_factor": 5.0,
             "use_dice": false,
             "sim_class": "liftreg.layers.losses.NCC2D"
         },
@@ -60,6 +64,10 @@
         "output_path": "/home/zzx/data/exp_liftreg_2d",
         "save_model_frequency": 50,
         "val_frequency": 20,
-        "num_refine_steps": 5
+        "num_refine_steps": 1,
+        "use_polyrigid": false,
+        "num_segments": 3,
+        "use_velocity": false,
+        "int_steps": 0
     }
 }

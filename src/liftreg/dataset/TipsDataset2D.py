@@ -1,5 +1,6 @@
 from __future__ import division, print_function
 
+import json
 import os
 from pathlib import Path
 
@@ -17,7 +18,29 @@ from torch.utils.data import Dataset
 from torchio import LabelMap, ScalarImage, Subject
 from xvr.dicom import read_xray
 from liftreg.dataset.FluoroDataset import Warp
+from liftreg.utils.compute_weights_2d import compute_weights_2d
 from torchvision.transforms.functional import center_crop
+
+_DRR_SUFFIX = "-DRR.mhd"
+_PHASE_LIST_FILES = {
+    "train": "train_list.json",
+    "val": "val_list.json",
+    "test": "test_list.json",
+    "debug": "debug_list.json",
+}
+_PHASE_MANIFEST_KEYS = {
+    "train": "train_identifiers",
+    "val": "val_identifiers",
+    "test": "test_identifiers",
+    "debug": "debug_identifiers",
+}
+
+
+def identifier_from_drr_filename(filename: str) -> str:
+    if not filename.endswith(_DRR_SUFFIX):
+        raise ValueError(f"Not a DRR mhd filename: {filename}")
+    return filename[: -len(_DRR_SUFFIX)]
+
 
 class TipsDataset2D(Dataset):
     """
@@ -51,6 +74,15 @@ class TipsDataset2D(Dataset):
             self.max_num_for_loading = max_num
 
         self.has_label = option[("use_segmentation_map", False, "load segmentation maps")]
+        self.provide_weights = option[("provide_weights", False, "online compute polyrigid weights")]
+        self.num_segments = int(option[("num_segments", 3, "K for polyrigid")])
+        self.label_groups = option[("label_groups", None, "list[int] | list[list[int]]; None=auto sorted unique")]
+        self.weightfn = option[("weightfn", "gravity", "gravity|invdf|exp")]
+        if self.provide_weights and not self.has_label:
+            raise ValueError(
+                "provide_weights=True requires use_segmentation_map=True so that "
+                "source_label is available to compute polyrigid weights."
+            )
         self.spacing = option[("spacing_to_refer", (1, 1, 1), "")]
         self.img_after_resize = tuple(option[("img_after_resize", (160, 160), "")])
         self.load_projection_interval = option[("load_projection_interval", 1, "")]
@@ -72,17 +104,100 @@ class TipsDataset2D(Dataset):
              [0, 0, 0, 1]], dtype=torch.float32)
         self.detector_spacing = option[("detector_spacing", 0.7255, "")]
         self.detector_width = option[("detector_width", 384, "")]
+        self.split_list_json = option[(
+            "split_list_json",
+            None,
+            "path to split json (list or manifest); None -> {data_path}/{phase}_list.json",
+        )]
 
         self.identifier_list = []
         self.get_identifier_list()
         self.init_img_pool()
 
+    def _default_split_list_path(self):
+        list_name = _PHASE_LIST_FILES.get(self.phase)
+        if list_name is None:
+            return None
+        path = os.path.join(self.data_path, list_name)
+        return path if os.path.isfile(path) else None
+
+    def _resolve_split_list_path(self):
+        cfg = self.split_list_json
+        if cfg is not None:
+            if isinstance(cfg, dict):
+                path = cfg.get(self.phase)
+                if path:
+                    return path
+            elif isinstance(cfg, str):
+                return cfg
+            else:
+                raise ValueError(f"split_list_json must be str or dict, got {type(cfg)}")
+        return self._default_split_list_path()
+
+    def _identifiers_from_json_payload(self, data):
+        if isinstance(data, list):
+            return list(data)
+        if not isinstance(data, dict):
+            raise ValueError(f"Split list json must be a list or dict, got {type(data)}")
+        key = _PHASE_MANIFEST_KEYS.get(self.phase)
+        if key and key in data:
+            return list(data[key])
+        alt_key = f"{self.phase}_identifiers"
+        if alt_key in data:
+            return list(data[alt_key])
+        nested = data.get(f"{self.phase}_level_split") or data.get("sample_level_split")
+        if isinstance(nested, dict):
+            ids = nested.get(f"{self.phase}_identifiers")
+            if ids is not None:
+                return list(ids)
+        raise ValueError(
+            f"Cannot find identifiers for phase={self.phase} in split list json"
+        )
+
+    def _load_identifiers_from_json(self, json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        identifiers = self._identifiers_from_json_payload(data)
+        validated = []
+        missing = []
+        for ident in identifiers:
+            drr = os.path.join(self.data_path, f"{ident}-DRR.mhd")
+            dsa = os.path.join(self.data_path, f"{ident}-DSA.mhd")
+            if os.path.isfile(drr) and os.path.isfile(dsa):
+                validated.append(ident)
+            else:
+                missing.append(ident)
+        if missing:
+            print(
+                f"[TipsDataset2D:{self.phase}] skip {len(missing)} identifiers "
+                f"missing DRR/DSA under {self.data_path}: {missing[:3]}"
+                + (" ..." if len(missing) > 3 else "")
+            )
+        return validated
+
+    def _scan_identifiers_from_dir(self):
+        identifiers = []
+        for file in sorted(os.listdir(self.data_path)):
+            if file.endswith(_DRR_SUFFIX):
+                identifiers.append(identifier_from_drr_filename(file))
+        return identifiers
+
     def get_identifier_list(self):
-        for file in os.listdir(self.data_path):
-            if file.endswith("DRR.mhd"):
-                self.identifier_list.append(file.split("-")[0])
+        list_path = self._resolve_split_list_path()
+        if list_path is not None:
+            self.identifier_list = self._load_identifiers_from_json(list_path)
+            print(
+                f"[TipsDataset2D:{self.phase}] loaded {len(self.identifier_list)} "
+                f"identifiers from {list_path}"
+            )
+        else:
+            self.identifier_list = self._scan_identifiers_from_dir()
+            print(
+                f"[TipsDataset2D:{self.phase}] scanned {len(self.identifier_list)} "
+                f"identifiers from {self.data_path}"
+            )
         if self.max_num_for_loading > 0:
-            self.identifier_list = self.identifier_list[:self.max_num_for_loading]
+            self.identifier_list = self.identifier_list[: self.max_num_for_loading]
 
     def _init_projector_if_needed(self):
         if not hasattr(self, "_siddon") or self._siddon is None:
@@ -343,12 +458,20 @@ class TipsDataset2D(Dataset):
         proj = (np.ascontiguousarray(proj.astype(np.float32)).astype(np.float32))
         return np.ascontiguousarray(self._resize_projection_stack(proj, mode="nearest"))
 
-    def _build_offline_augmented_bank(self, identifier, source_proj_np, target_proj_np):
+    def _build_offline_augmented_bank(
+        self,
+        identifier,
+        source_proj_np,
+        target_proj_np,
+        source_label_np=None,
+    ):
         if self.offline_aug_variants <= 0:
             return None
 
         source_proj_np = np.ascontiguousarray(source_proj_np.astype(np.float32))
         target_proj_np = np.ascontiguousarray(target_proj_np.astype(np.float32))
+        if source_label_np is not None:
+            source_label_np = np.ascontiguousarray(source_label_np.astype(np.float32))
 
         if source_proj_np.shape != target_proj_np.shape:
             raise ValueError(
@@ -359,12 +482,17 @@ class TipsDataset2D(Dataset):
             raise ValueError(
                 f"Expected [P, H, W] projection stack for {identifier}, got {source_proj_np.shape}"
             )
+        if source_label_np is not None and source_label_np.shape != source_proj_np.shape:
+            raise ValueError(
+                f"source_label shape {source_label_np.shape} != source_proj shape "
+                f"{source_proj_np.shape} for {identifier}"
+            )
 
         rotate_ranges = self._resolve_axis_ranges(self.aug_rotate_deg, symmetric=True)
         translate_ranges = self._resolve_axis_ranges(self.aug_translate_vox, symmetric=True)
         scale_min, scale_max = self._resolve_scale_range(self.aug_scale_range)
 
-        def _apply_shared_2d_affine(src_np, tgt_np, theta_2x3):
+        def _apply_shared_2d_affine(src_np, tgt_np, theta_2x3, lab_np=None):
             src_t = torch.from_numpy(src_np).unsqueeze(0).to(dtype=torch.float32)
             tgt_t = torch.from_numpy(tgt_np).unsqueeze(0).to(dtype=torch.float32)
             theta = torch.from_numpy(theta_2x3).unsqueeze(0).to(dtype=torch.float32)
@@ -375,19 +503,22 @@ class TipsDataset2D(Dataset):
             tgt_aug = F.grid_sample(
                 tgt_t, grid, mode="bilinear", padding_mode="border", align_corners=False
             )
+            lab_aug_np = None
+            if lab_np is not None:
+                lab_t = torch.from_numpy(lab_np).unsqueeze(0).to(dtype=torch.float32)
+                lab_aug = F.grid_sample(
+                    lab_t, grid, mode="nearest", padding_mode="zeros", align_corners=False
+                )
+                lab_aug_np = lab_aug.squeeze(0).cpu().numpy().astype(np.float32)
             return (
                 src_aug.squeeze(0).cpu().numpy().astype(np.float32),
                 tgt_aug.squeeze(0).cpu().numpy().astype(np.float32),
+                lab_aug_np,
             )
 
         p, h, w = source_proj_np.shape
         _ = p
-        aug_source_proj = []
-        aug_target_proj = []
-        aug_affines = []
-        aug_source_seg_proj = [] if self.has_label else None
 
-        # for _ in range(self.offline_aug_variants):
         angle_deg = float(np.random.uniform(rotate_ranges[2][0], rotate_ranges[2][1]))
         angle_rad = np.deg2rad(angle_deg)
         scale = float(np.random.uniform(scale_min, scale_max))
@@ -407,31 +538,10 @@ class TipsDataset2D(Dataset):
             dtype=np.float32,
         )
 
-        source_proj_aug, target_proj_aug = _apply_shared_2d_affine(
-            source_proj_np, target_proj_np, theta_2x3
+        source_proj_aug, target_proj_aug, source_label_aug = _apply_shared_2d_affine(
+            source_proj_np, target_proj_np, theta_2x3, lab_np=source_label_np,
         )
-        # aug_source_proj.append(source_proj_aug)
-        # aug_target_proj.append(target_proj_aug)
-        # aug_affines.append(theta_2x3)
-
-        # if self.has_label:
-        #     label_t = torch.from_numpy(source_proj_np).unsqueeze(0).to(dtype=torch.float32)
-        #     theta_t = torch.from_numpy(theta_2x3).unsqueeze(0).to(dtype=torch.float32)
-        #     grid = F.affine_grid(theta_t, size=label_t.shape, align_corners=False)
-        #     label_aug = F.grid_sample(
-        #         label_t, grid, mode="nearest", padding_mode="zeros", align_corners=False
-        #     )
-        #     aug_source_seg_proj.append(label_aug.squeeze(0).cpu().numpy().astype(np.float32))
-
-        # save_dict = {
-        #     "aug_source_proj": np.stack(aug_source_proj, axis=0).astype(np.float32),
-        #     "aug_target_proj": np.stack(aug_target_proj, axis=0).astype(np.float32),
-        #     "aug_affines": np.stack(aug_affines, axis=0).astype(np.float32),
-        # }
-        # if self.has_label:
-        #     save_dict["aug_source_seg_proj"] = np.stack(aug_source_seg_proj, axis=0).astype(np.float32)
-        # return save_dict
-        return source_proj_aug, target_proj_aug
+        return source_proj_aug, target_proj_aug, source_label_aug
 
     def _preprocess_and_cache(self, identifier):
         npz_path = os.path.join(self.cache_dir, f"{identifier}.npz")
@@ -732,26 +842,67 @@ class TipsDataset2D(Dataset):
             target_proj = np.ascontiguousarray(npz["target_proj"].astype(np.float32))
             spacing = np.ascontiguousarray(npz["spacing"].astype(np.float32))
             source_mask = np.ascontiguousarray(npz["source_mask"].astype(np.uint8))
+
         if self.enable_aug:
-            source_proj, target_proj = self._build_offline_augmented_bank(
+            label_for_aug = source_mask if self.has_label else None
+            source_proj, target_proj, label_aug = self._build_offline_augmented_bank(
                 identifier,
                 source_proj,
                 target_proj,
+                source_label_np=label_for_aug,
             )
             source_proj, target_proj, _ = self._augment_2d_projs_shared(
                 source_proj, target_proj)
+            if label_aug is not None:
+                # Cast back to uint8 to keep label semantics; nearest sampling
+                # preserves integer values so rounding is safe.
+                source_mask = np.ascontiguousarray(
+                    np.rint(label_aug).clip(0, 255).astype(np.uint8)
+                )
 
         sample = {
             "source_proj": source_proj,
             "target_proj": target_proj,
             "source_label": source_mask,
-            "spacing": spacing
+            "spacing": spacing,
         }
+
+        if self.provide_weights:
+            lab2d = source_mask
+            if lab2d.ndim == 3:
+                lab2d = lab2d[0]
+            try:
+                _, weights = compute_weights_2d(
+                    lab2d,
+                    labels=self.label_groups,
+                    weightfn=self.weightfn,
+                    normalize=True,
+                )
+            except ValueError:
+                # Empty / all-zero label fallback: uniform weights across K segments
+                weights = torch.full(
+                    (max(self.num_segments, 1), int(lab2d.shape[-2]), int(lab2d.shape[-1])),
+                    1.0 / max(self.num_segments, 1),
+                    dtype=torch.float32,
+                )
+            weights = self._pad_or_truncate_weights(weights, self.num_segments)
+            sample["weights"] = weights.numpy().astype(np.float32)
 
         if self.transform:
             sample["source_proj"] = self.transform(sample["source_proj"])
             sample["source_label"] = self.transform(sample["source_label"])
         return sample, identifier
+
+    @staticmethod
+    def _pad_or_truncate_weights(w: torch.Tensor, K: int) -> torch.Tensor:
+        """Match the channel count of ``w`` to ``K`` via zero-pad or truncation."""
+        k_case = int(w.shape[0])
+        if k_case == K:
+            return w
+        if k_case < K:
+            pad = torch.zeros((K - k_case, *w.shape[1:]), dtype=w.dtype)
+            return torch.cat([w, pad], dim=0)
+        return w[:K]
 
     def __len__(self):
         return len(self.identifier_list)

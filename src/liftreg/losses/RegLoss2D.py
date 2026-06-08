@@ -49,13 +49,20 @@ class loss(nn.Module):
     def forward(self, output):
         # output dict comes from RegNet2D
         # which outputs: warped_moving, target_proj, phi
-        
+        # and optionally: velocity (SVF mode), polyrigid_params, warped_label
+
         target = output['target_proj']
         warped_moving = output['warped_moving']
         phi = output['phi']
-        
+        _, _, H, W = phi.shape
+        # 与 align_corners=True 的归一化一致
+        # phi_norm_y = 2.0 * phi[:, 0:1] / max(H - 1, 1)
+        # phi_norm_x = 2.0 * phi[:, 1:2] / max(W - 1, 1)
+        # phi_norm = torch.cat([phi_norm_y, phi_norm_x], dim=1)
+        # For SVF mode, regularize the velocity field (phi is automatically smoothed by integration)
+        field_for_reg = output.get('velocity', phi)
         loss_sim = self.sim_loss(target, warped_moving) * self.sim_factor
-        loss_reg = self.reg_loss(phi) * self.reg_factor
+        loss_reg = self.reg_loss(field_for_reg) * self.reg_factor
         
         total_loss = loss_sim + loss_reg
         losses = {

@@ -51,7 +51,7 @@ class ConvBlock(nn.Module):
 class RegNet2D(nn.Module):
     """
     2D Registration Network based on UNet architecture.
-    
+
     Args:
         img_size: Spatial size of the input images (H, W).
         enc_channels: Tuple of encoder channel sizes.
@@ -61,15 +61,27 @@ class RegNet2D(nn.Module):
             instead of directly predicting a per-pixel flow field.
         num_segments: Number of rigid segments for polyrigid mode (ignored when
             use_polyrigid is False).
+        use_velocity: If True, predict a stationary velocity field (SVF) and
+            integrate it via scaling-and-squaring to obtain a diffeomorphic
+            displacement field. Mutually exclusive with ``use_polyrigid``.
+        int_steps: Number of squaring iterations T for the SVF integration
+            (effective horizon ~ 2**T). Typical 5-8. Ignored unless
+            ``use_velocity`` is True.
     """
     def __init__(self, img_size=(160, 160), enc_channels=(16, 32, 64, 128),
                  dec_channels=(64, 32, 16, 16), use_polyrigid=False,
-                 num_segments=4):
+                 num_segments=4, use_velocity=False, int_steps=7):
         super(RegNet2D, self).__init__()
-        
+
+        assert not (use_polyrigid and use_velocity), (
+            "use_polyrigid and use_velocity are mutually exclusive"
+        )
+
         self.img_size = img_size
         self.use_polyrigid = use_polyrigid
         self.num_segments = num_segments
+        self.use_velocity = use_velocity
+        self.int_steps = int(int_steps)
 
         # Encoder
         self.enc = nn.ModuleList()
@@ -100,6 +112,11 @@ class RegNet2D(nn.Module):
             # Small-weight init so initial displacement is near zero
             self.fc_polyrigid[-1].weight.data.normal_(mean=0.0, std=0.1)
             self.fc_polyrigid[-1].bias.data.zero_()
+        elif self.use_velocity:
+            # Stationary velocity field head (integrated via scaling-and-squaring)
+            self.velocity_conv = nn.Conv2d(dec_channels[-1], 2, kernel_size=3, padding=1)
+            self.velocity_conv.weight.data.normal_(0, 1e-5)
+            self.velocity_conv.bias.data.zero_()
         else:
             # Dense flow head
             self.flow_conv1 = nn.Conv2d(dec_channels[-1], 2, kernel_size=3, padding=1)
@@ -133,6 +150,21 @@ class RegNet2D(nn.Module):
 
         return x
 
+    def _integrate_svf(self, v):
+        """Stationary velocity field -> diffeomorphic displacement via
+        scaling-and-squaring. All flows are in pixel units (consistent with
+        SpatialTransformer).
+
+        phi_0 = v / 2**T
+        phi_{k+1}(x) = phi_k(x) + phi_k(x + phi_k(x))
+                    = phi_k + transformer(phi_k, phi_k)
+        """
+        T = self.int_steps
+        phi = v / float(2 ** T)
+        for _ in range(T):
+            phi = phi + self.transformer(phi, phi, mode='bilinear')
+        return phi
+
     @staticmethod
     def _polyrigid_to_displacement(polyrigid_params, weights):
         """
@@ -165,6 +197,8 @@ class RegNet2D(nn.Module):
         features = self._estimate_flow(x)
 
         # Flow prediction
+        polyrigid_params = None
+        velocity = None
         if self.use_polyrigid:
             B = source.shape[0]
             # Predict per-segment 2D translations
@@ -176,8 +210,10 @@ class RegNet2D(nn.Module):
             # Expects input_dict['weights'] of shape (B, K, H, W)
             seg_weights = input_dict['weights'].to(source.device)
             flow = self._polyrigid_to_displacement(polyrigid_params, seg_weights)
+        elif self.use_velocity:
+            velocity = self.velocity_conv(features)  # [B, 2, H, W]
+            flow = self._integrate_svf(velocity)
         else:
-            polyrigid_params = None
             flow = self.flow_conv1(features)  # [B, 2, H, W]
 
         # Warp source
@@ -191,6 +227,8 @@ class RegNet2D(nn.Module):
 
         if self.use_polyrigid:
             output['polyrigid_params'] = polyrigid_params  # (B, K, 2)
+        if self.use_velocity:
+            output['velocity'] = velocity  # (B, 2, H, W) stationary velocity field
         
         # Warp segmentation if provided
         if 'source_label' in input_dict:

@@ -1,8 +1,13 @@
 import json
 import os
+import sys
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-
+import pandas as pd
 import numpy as np
 import SimpleITK as sitk
 import torch
@@ -13,8 +18,11 @@ from diffdrr.pose import RigidTransform
 from diffdrr.renderers import Siddon
 from torchio import LabelMap, ScalarImage
 from scipy.spatial.transform import Rotation
+from utils.dicom_to_extrinsic import collect_dsa_mhd_info
 
-DATA_PATH = "/home/zzx/data/pair_CT_DSA_10"
+DATASET_TYPE = "dataset_2"
+INTENSITY_OFFSET = True
+DATA_PATH = f"/data/zhouzhexin/20260521/3D2D_{DATASET_TYPE}"
 OUTPUT_DIR = os.path.join(DATA_PATH, "drr_generated")
 TARGET_SPACING = (2.2, 2.2, 2.2)
 TARGET_SIZE = (160, 160, 160)
@@ -39,7 +47,7 @@ def rigid_from_6params(rx_deg, ry_deg, rz_deg, tx, ty, tz):
     return T
 
 
-def canonicalize(volume: ScalarImage, case_name: str) -> ScalarImage:
+def canonicalize(volume: ScalarImage, rigid_param: Optional[np.ndarray]) -> ScalarImage:
     """Move the volume's isocenter to the origin in world coordinates."""
     isocenter = volume.get_center()
     tinv = np.array([
@@ -49,25 +57,24 @@ def canonicalize(volume: ScalarImage, case_name: str) -> ScalarImage:
         [0, 0, 0, 1],
     ], dtype=np.float64)
     # 你的参数（顺序若不对需改）
-    affine_dict = {
-        "chenchuanlai": (-2.50484,6.68063,0.821655,69.817,18.4138,-24.9237),
-        "chengshijiu": (-1.45579,5.03901,0.431279,19.1936,-1.98783,-36.2865),
-        "cuihaiping": (-1.98277,1.90433,0.041432,-19.9544,-14.1942,-62.2494),
-        "liaijiao": (0.609258,-8.12951,3.02794,6.00707,32.0073,-142.665),
-        "liufang": (-5.33246,1.23107,-0.252757,-12.7675,-2.59383,-39.9518),
-        "liwanggui": (0.255239,-1.58393,0.540072,0.616907,24.1804,-50.1729),
-        "lixiaofa": (1.42632,6.14718,-1.3745,33.0599,22.3215,75.9592),
-        "meichuanyao": (1.35667,0.798763,0.0509796,22.5106,34.1446,79.8066),
-        "shenlixin": (-0.538263,-4.0883,1.07946,57.2886,17.8118,-141.624),
-        "shimingzhi": (-1.68855,7.32938,0.546483,20.4227,75.6821,-0.69562),
-    }
+    # affine_dict = {
+    #     "chenchuanlai": (-2.50484,6.68063,0.821655,69.817,18.4138,-24.9237),
+    #     "chengshijiu": (-1.45579,5.03901,0.431279,19.1936,-1.98783,-36.2865),
+    #     "cuihaiping": (-1.98277,1.90433,0.041432,-19.9544,-14.1942,-62.2494),
+    #     "liaijiao": (0.609258,-8.12951,3.02794,6.00707,32.0073,-142.665),
+    #     "liufang": (-5.33246,1.23107,-0.252757,-12.7675,-2.59383,-39.9518),
+    #     "liwanggui": (0.255239,-1.58393,0.540072,0.616907,24.1804,-50.1729),
+    #     "lixiaofa": (1.42632,6.14718,-1.3745,33.0599,22.3215,75.9592),
+    #     "meichuanyao": (1.35667,0.798763,0.0509796,22.5106,34.1446,79.8066),
+    #     "shenlixin": (-0.538263,-4.0883,1.07946,57.2886,17.8118,-141.624),
+    #     "shimingzhi": (-1.68855,7.32938,0.546483,20.4227,75.6821,-0.69562),
+    # }
 
-    T_user_lps = rigid_from_6params(*affine_dict[case_name])
+    T_user_lps = rigid_from_6params(*rigid_param)
     # T_user = np.linalg.inv(T_user)
     # LPS → RAS 转换: 翻转 x, y 轴
     S = np.diag([-1.0, -1.0, 1.0, 1.0])
     T_user_ras = S @ T_user_lps @ S
-
     affine_new = T_user_ras @ tinv @ volume.affine
     # affine_new = tinv @ volume.affine
     # return ScalarImage(tensor=volume.data, affine=tinv.dot(volume.affine))
@@ -78,8 +85,8 @@ def transform_hu_to_density(volume: torch.Tensor, bone_attenuation_multiplier: f
     """Same HU->density rule used in FluoroDataset."""
     volume = volume.to(torch.float32)
     density = torch.empty_like(volume)
-    # air_threshold = -800
-    air_threshold = 0
+    air_threshold = -800
+    # air_threshold = 0
     soft_tissue_threshold = 350
     bone_threshold = 1200
     soft_tissue = torch.where((air_threshold < volume) & (volume <= soft_tissue_threshold))
@@ -95,32 +102,10 @@ def transform_hu_to_density(volume: torch.Tensor, bone_attenuation_multiplier: f
     density /= density.max()
     return density
 
-
-def load_and_preprocess_ct(ct_mhd_path: str, case_name: str) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Returns:
-        density_xyz: (X, Y, Z) float32 tensor
-        affine_inv:  (4, 4) float32 tensor
-    """
-    source_img = ScalarImage(ct_mhd_path)
-    source_img.data = source_img.data - 1024.0
-    source_img.data[torch.where(source_img.data > 2048)] = 2048
-    source_img = canonicalize(source_img, case_name)
-    # tfm = torchio.transforms.Compose([
-    #     torchio.transforms.Resample(TARGET_SPACING),
-    #     torchio.transforms.CropOrPad(TARGET_SIZE, padding_mode=-2048),
-    # ])
-    # source_img = tfm(source_img)
-    density = transform_hu_to_density(source_img.data, bone_attenuation_multiplier=5.0)
-    density_xyz = density.squeeze(0).to(torch.float32).cpu()
-    affine = torch.as_tensor(source_img.affine, dtype=torch.float32)
-    return density_xyz, affine.inverse()
-
-
 def load_ct_and_mask(
     ct_mhd_path: str,
     seg_path: Optional[str],
-    case_name: str,
+    rigid_param: Optional[np.ndarray],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
     """
     Load CT and (optional) segmentation, applying the same canonicalize so they
@@ -132,9 +117,11 @@ def load_ct_and_mask(
         affine_inv:  (4, 4) float32 tensor
     """
     source_img = ScalarImage(ct_mhd_path)
-    source_img.data = source_img.data - 1024.0
-    source_img.data[torch.where(source_img.data > 2048)] = 2048
-    source_img = canonicalize(source_img, case_name)
+    if INTENSITY_OFFSET:
+        data = source_img.data - 1024.0
+        data = torch.where(data > 2048, torch.tensor(2048.0, dtype=data.dtype), data)
+        source_img.set_data(data)
+    source_img = canonicalize(source_img, rigid_param)
     canonical_affine = np.array(source_img.affine, dtype=np.float64).copy()
 
     density = transform_hu_to_density(source_img.data, bone_attenuation_multiplier=1.0)
@@ -259,17 +246,6 @@ def render_mask_first_hit(
     return out.detach().cpu()
 
 
-def find_first_ct_mhd(case_dir: str) -> Optional[str]:
-    ct_dir = os.path.join(case_dir, "CT")
-    if not os.path.isdir(ct_dir):
-        return None
-    mhd_files = sorted(Path(ct_dir).glob("**/*.mhd"))
-    # mhd_files = sorted(Path(ct_dir).glob("**/data_affined.mhd"))
-    if len(mhd_files) == 0:
-        return None
-    return str(mhd_files[0])
-
-
 def find_seg_nii(case_dir: str) -> Optional[str]:
     """Return path to <case>/Segmentation/seg.nii.gz if it exists."""
     seg_path = os.path.join(case_dir, "Segmentation", "vertebrae.nii.gz")
@@ -352,22 +328,47 @@ def drr2fluro(drr_np):
     drr_like = (drr_like - drr_like.min()) / (drr_like.max() - drr_like.min() + 1e-8)
     return drr_like
 
+def get_rigid_param_by_case(case_name: str, df: pd.DataFrame):
+    # 如果是“包含关系”（patient_id 里包含 case_name）
+    hit = df[df["patient_id"].astype(str).str.contains(case_name, na=False)]
+    
+    # 如果你想“完全相等”，改成：
+    # hit = df[df["patient_id"].astype(str) == case_name]
+    if hit.empty:
+        return None
+    # 取第一条匹配（如果有多条可自行改策略）
+    row = hit.iloc[0]
+    rigid_param = row[[f"rigid_param{i}" for i in range(1, 7)]].to_numpy(dtype=float)
+    return rigid_param
+
+class path_finder:
+    def __init__(self, case_name, ct_patient_name, ct_file_name):
+        self.ct_mhd_path = os.path.join(DATA_PATH, ct_patient_name, "CT", ct_file_name + ".mhd")
+        self.rigid_case_name = f"{ct_patient_name}_DSA_{case_name}-CT_{ct_patient_name}_CT_{ct_file_name}"
+        self.res_file_name = f"{ct_patient_name}-{case_name}-{ct_file_name}"
+
 def main() -> None:
     # os.makedirs(OUTPUT_DIR, exist_ok=True)
-    records: List[Dict] = collect_dsa_records_from_cases(DATA_PATH)
+    records: List[Dict] = collect_dsa_mhd_info(DATA_PATH, if_save=False)
+    # records: List[Dict] = collect_dsa_records_from_cases(DATA_PATH)
     generated_index: List[Dict] = []
     skipped: List[Dict] = []
-    ct_cache: Dict[str, Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]] = {}
 
     # Reuse detector/siddon for same geometry tuple.
     projector_cache: Dict[Tuple[float, int, int, float, float], Tuple[Siddon, Detector]] = {}
-    output_path = "/home/zzx/data/tips_drr_org"
+
+    res_path = f"/data/zhouzhexin/20260521/result/{DATASET_TYPE}"
+    csv_path = "/data/zhouzhexin/20260521/result/reg_result.csv"
+    output_path = f"/home/zzx/data/tips_drr_{DATASET_TYPE}"
     os.makedirs(output_path, exist_ok=True)
-    dsa_path = "/home/zzx/data/tips_drr/val"
+
+    df = pd.read_csv(csv_path)
+
     for rec in records:
         case_name = rec.get("case_name")
-        if case_name != "shenlixin":
-            continue
+        ct_patient_name = rec.get("ct_patient_name", case_name.split("_")[0])
+        # if ct_patient_name != "HE_XIN_RONG":
+        #     continue
         extrinsic = rec.get("extrinsic")
         if not case_name or extrinsic is None:
             skipped.append({"case_name": case_name, "reason": "missing_case_or_extrinsic"})
@@ -389,18 +390,29 @@ def main() -> None:
             skipped.append({"case_name": case_name, "reason": "invalid_spacing_or_width"})
             continue
 
-        case_dir = os.path.join(DATA_PATH, case_name)
-        ct_mhd_path = find_first_ct_mhd(case_dir)
+        case_dir = os.path.join(DATA_PATH, ct_patient_name)
+        # data_set2: ct_patient_name + "_A_CT_us", dataset_3: "data_CT_01_us", dataset_4: "data_CT_02"
+        if DATASET_TYPE == "dataset_2":
+            ct_file_name = ct_patient_name + "_A_CT_us"
+        elif DATASET_TYPE == "dataset_3":
+            ct_file_name = "data_CT_01_us"
+        elif DATASET_TYPE == "dataset_4":
+            ct_file_name = "data_CT_02"
+        else:
+            skipped.append({"case_name": case_name, "reason": "invalid_dataset_type"})
+            continue
+        ct_mhd_path = os.path.join(DATA_PATH, ct_patient_name, "CT", ct_file_name + ".mhd")
+        rigid_case_name = f"{ct_patient_name}_DSA_{case_name}-CT_{ct_patient_name}_CT_{ct_file_name}"
+        res_file_name = f"{ct_patient_name}-{case_name}-{ct_file_name}"
         if ct_mhd_path is None:
             skipped.append({"case_name": case_name, "reason": "missing_ct_mhd"})
             continue
 
         seg_path = find_seg_nii(case_dir)
-        if case_name not in ct_cache:
-            density_xyz, mask_xyz, affine_inv = load_ct_and_mask(ct_mhd_path, seg_path, case_name)
-            ct_cache[case_name] = (density_xyz, mask_xyz, affine_inv)
-        density_xyz, mask_xyz, affine_inv = ct_cache[case_name]
 
+        rigid_param = get_rigid_param_by_case(rigid_case_name, df)
+        density_xyz, mask_xyz, affine_inv = load_ct_and_mask(ct_mhd_path, seg_path, rigid_param)
+        # print(f"rigid_case_name: {rigid_case_name}, rigid_param: {rigid_param}")
         # geom_key = (float(sdd), int(detector_width), int(detector_height), float(dx), float(dy))
         geom_key = (float(sdd), int(new_detector_width), int(new_detector_height), float(new_dx), float(new_dy))
         if geom_key not in projector_cache:
@@ -414,8 +426,6 @@ def main() -> None:
         # case_out_dir = os.path.join(OUTPUT_DIR, case_name)
         # os.makedirs(case_out_dir, exist_ok=True)
         mhd_path = rec.get("mhd_path", f"{case_name}_unknown.mhd")
-        save_name = sanitize_name(Path(mhd_path).stem) + ".nii.gz"
-        # save_path = os.path.join(case_out_dir, save_name)
 
         drr_np = drr.numpy().astype(np.float32)  # (1, H, W)
         drr_np = np.flip(drr_np, axis=1)
@@ -433,13 +443,13 @@ def main() -> None:
             ref.SetDirection(img.GetDirection())
             ref.SetSpacing(out_spacing)
             return sitk.Resample(img, ref, sitk.Transform(), interpolator, 0.0, img.GetPixelIDValue())
-        dsa_img = sitk.ReadImage(os.path.join(dsa_path, case_name + "-DSA.mhd"))
+        dsa_img = sitk.ReadImage(os.path.join(res_path, res_file_name + "-DSA.mhd"))
         dsa_img = resize_sitk_2d_to(dsa_img, 512, 512)
         # drr_img.CopyInformation(dsa_img)
         drr_img.SetSpacing([new_dx, new_dy])
         # drr_np = drr2fluro(drr_np)
-        sitk.WriteImage(drr_img, os.path.join(output_path, case_name + "-DRR.mhd"))
-        sitk.WriteImage(dsa_img, os.path.join(output_path, case_name + "-DSA.mhd"))
+        sitk.WriteImage(drr_img, os.path.join(output_path, res_file_name + "-DRR.mhd"))
+        sitk.WriteImage(dsa_img, os.path.join(output_path, res_file_name + "-DSA.mhd"))
 
         mask_out_path: Optional[str] = None
         unique_labels: List[int] = []
@@ -452,7 +462,7 @@ def main() -> None:
             mask_np_2d = mask_np[0]
             mask_img = sitk.GetImageFromArray(mask_np_2d)
             mask_img.SetSpacing([new_dx, new_dy])
-            mask_out_path = os.path.join(output_path, case_name + "-vertebrae_mask.mhd")
+            mask_out_path = os.path.join(output_path, res_file_name + "-vertebrae_mask.mhd")
             sitk.WriteImage(mask_img, mask_out_path)
             unique_labels = [int(v) for v in np.unique(mask_np_2d).tolist()]
         else:
@@ -463,7 +473,7 @@ def main() -> None:
             "ct_mhd_path": ct_mhd_path,
             "seg_path": seg_path,
             "input_mhd_path": mhd_path,
-            # "output_drr_path": save_path,
+            "output_drr_path": output_path,
             "output_mask_path": mask_out_path,
             "unique_labels": unique_labels,
             "shape": list(drr_np.shape),
@@ -477,7 +487,8 @@ def main() -> None:
         })
         print(f"Generated DRR for {case_name}" + ("" if mask_out_path is None else " (+ MASK)"))
         # break
-
+    print(f"num_generated: {len(generated_index)}")
+    print(f"num_skipped: {len(skipped)}")
     index_path = os.path.join(OUTPUT_DIR, "generated_index.json")
     with open(index_path, "w", encoding="utf-8") as f:
         json.dump(

@@ -58,6 +58,9 @@
         },
         "output_path": "/home/zzx/data/exp_liftreg_2d",
         "save_model_frequency": 50,
-        "val_frequency": 20
+        "val_frequency": 20,
+        "num_refine_steps": 2,
+        "use_velocity": false,
+        "int_steps": 7
     }
 }

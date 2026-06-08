@@ -52,7 +52,20 @@ class RegTrainer2D:
         self.val_loader = DataLoader(self.val_dataset, batch_size=batch_size, shuffle=False, num_workers=workers[1])
         
         # Model
-        self.model = get_class(train_setting['model_class'])(img_size=dataset_setting['img_after_resize']).to(self.device)
+        use_polyrigid = bool(train_setting['use_polyrigid', False])
+        use_velocity = bool(train_setting['use_velocity', False])
+        if use_polyrigid and use_velocity:
+            raise ValueError("use_polyrigid and use_velocity are mutually exclusive")
+        num_segments = int(train_setting['num_segments', 3])
+        int_steps = int(train_setting['int_steps', 7])
+        model_kwargs = dict(img_size=dataset_setting['img_after_resize'])
+        if use_polyrigid:
+            model_kwargs.update(use_polyrigid=True, num_segments=num_segments)
+            print(f"[info] RegNet2D polyrigid mode enabled (K={num_segments})")
+        elif use_velocity:
+            model_kwargs.update(use_velocity=True, int_steps=int_steps)
+            print(f"[info] RegNet2D velocity (SVF) mode enabled (T={int_steps})")
+        self.model = get_class(train_setting['model_class'])(**model_kwargs).to(self.device)
         self.loss = get_class(train_setting['loss_class'])(train_setting['loss']).to(self.device)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=train_setting['optim']['lr'])
         self.writer = SummaryWriter(self.log_path + "/" + datetime.now().strftime("%Y%m%d-%H%M%S"))
@@ -266,6 +279,10 @@ if __name__ == '__main__':
     if args.test_from is not None:
         setting["train"]["test_forward"] = True
         setting["train"]["test_from"] = args.test_from
+        if args.save_path is not None:
+            save_path = args.save_path
+        else:
+            save_path = os.path.join(os.path.dirname(os.path.dirname(args.test_from)), "tests")
     if args.continue_from is not None:
         setting["train"]["continue_train"] = True
         setting["train"]["continue_from"] = args.continue_from
@@ -285,7 +302,7 @@ if __name__ == '__main__':
     # trainer.export_pt(exp_path)
     # 测试前向传播
     if args.test:
-        _ = trainer.validate(0, save_path = args.save_path)
+        _ = trainer.validate(0, save_path = save_path)
         del _
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

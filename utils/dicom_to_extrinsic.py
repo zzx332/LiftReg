@@ -221,7 +221,7 @@ def _parse_mhd_header(mhd_path: Path) -> Dict[str, str]:
     return meta
 
 
-def collect_dsa_mhd_info(data_path: str) -> List[Dict]:
+def collect_dsa_mhd_info(data_path: str, if_save: bool = False) -> List[Dict]:
     """
     读取 data_path 下所有 case/DSA/*/*.mhd，并提取几何参数:
       - ElementSpacing -> dx, dy
@@ -237,7 +237,7 @@ def collect_dsa_mhd_info(data_path: str) -> List[Dict]:
         if not dsa_dir.exists():
             continue
 
-        for mhd_path in sorted(dsa_dir.glob("*/*.mhd")):
+        for mhd_path in sorted(dsa_dir.rglob("*.mhd")):
             meta = _parse_mhd_header(mhd_path)
 
             if "ElementSpacing" not in meta or "DimSize" not in meta:
@@ -249,10 +249,14 @@ def collect_dsa_mhd_info(data_path: str) -> List[Dict]:
                 continue
 
             # 若 mhd 中包含几何参数，则计算该条目的外参
-            sdd = float(meta["DistanceSourceToDetector"]) if "DistanceSourceToDetector" in meta else None
-            sid = float(meta["DistanceSourceToPatient"]) if "DistanceSourceToPatient" in meta else None
-            primary = float(meta["PositionerPrimaryAngle"]) if "PositionerPrimaryAngle" in meta else None
-            secondary = float(meta["PositionerSecondaryAngle"]) if "PositionerSecondaryAngle" in meta else None
+            # sdd = float(meta["DistanceSourceToDetector"]) if "DistanceSourceToDetector" in meta else None
+            # sid = float(meta["DistanceSourceToPatient"]) if "DistanceSourceToPatient" in meta else None
+            # primary = float(meta["PositionerPrimaryAngle"]) if "PositionerPrimaryAngle" in meta else None
+            # secondary = float(meta["PositionerSecondaryAngle"]) if "PositionerSecondaryAngle" in meta else None
+            sdd = float(meta["Extra_SourceToDetectorDistance"]) if "Extra_SourceToDetectorDistance" in meta else None
+            sid = float(meta["Extra_SourceToIsoCenterDistance"]) if "Extra_SourceToIsoCenterDistance" in meta else None
+            primary = float(meta["Extra_PrimaryAngle"]) if "Extra_PrimaryAngle" in meta else None
+            secondary = float(meta["Extra_SecondaryAngle"]) if "Extra_SecondaryAngle" in meta else None
 
             extrinsic_tensor = None
             if None not in (sdd, sid, primary, secondary):
@@ -265,8 +269,10 @@ def collect_dsa_mhd_info(data_path: str) -> List[Dict]:
                 extrinsic_tensor = torch.from_numpy(extrinsic).float()
 
             record = {
-                "case_name": case_dir.name,
+                # "case_name": case_dir.name,
+                "case_name": Path(mhd_path).stem,
                 "mhd_path": str(mhd_path),
+                "ct_patient_name": case_dir.name,
                 "dx": spacing_vals[0],
                 "dy": spacing_vals[1],
                 "detector_width": dim_vals[0],
@@ -278,9 +284,20 @@ def collect_dsa_mhd_info(data_path: str) -> List[Dict]:
                 "PositionerSecondaryAngle": secondary,
                 "extrinsic": extrinsic_tensor,  # 4x4 tensor, 缺参时为 None
             }
-            save_path = f"{mhd_path.parent}/dsa_mhd_info.pt"
-            print(save_path)
-            torch.save(record, save_path)
+            if ("dx" not in records or "dy" not in records) and "ElementSpacing" in records:
+                sp = record["ElementSpacing"]
+                vals = [float(x) for x in (sp.split() if isinstance(sp, str) else sp)]
+                if len(vals) >= 2:
+                    record["dx"], record["dy"] = vals[0], vals[1]
+            if ("detector_width" not in record or "detector_height" not in record) and "DimSize" in record:
+                ds = record["DimSize"]
+                vals = [int(float(x)) for x in (ds.split() if isinstance(ds, str) else ds)]
+                if len(vals) >= 2:
+                    record["detector_width"], record["detector_height"] = vals[0], vals[1]
+            if if_save:
+                save_path = f"{mhd_path.parent}/dsa_mhd_info.pt"
+                print(save_path)
+                torch.save(record, save_path)
             records.append(record)
 
     return records
