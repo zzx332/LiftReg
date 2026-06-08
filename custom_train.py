@@ -22,8 +22,6 @@ from liftreg.utils.utils import set_seed_for_demo
 
 
 def prepare(args):
-    output_path = args.output_path
-    exp_name = args.exp_name
     data_path = args.data_path
     val_data_path = args.val_data_path
     test_data_path = args.test_data_path
@@ -32,13 +30,12 @@ def prepare(args):
     gpu_id = args.gpu_id
     mode = "test" if args.test_forward else None
     test_from = args.test_from
-    dataset_name = data_path.split('/')[-1]
-
+    setting = pars.ParameterDict()
+    setting.load_JSON(setting_path)
     # Create experiment folder
     timestamp = '{:%Y_%m_%d_%H_%M_%S}'.format(datetime.now())
-    exp_folder_path = os.path.join(output_path, dataset_name, exp_name, timestamp)
+    exp_folder_path = os.path.join(setting["train"]["output_path"], args.exp_name, timestamp)
     make_dir(exp_folder_path)
-
     # Create checkpoint path, record path and log path
     checkpoint_path = os.path.join(exp_folder_path, "checkpoints")
     make_dir(checkpoint_path)
@@ -48,16 +45,6 @@ def prepare(args):
     make_dir(log_path)
     test_path = os.path.join(exp_folder_path, "tests")
     make_dir(test_path)
-
-
-    setting_folder_path = args.setting_path
-    # setting_path = os.path.join(setting_folder_path, 'cur_task_setting.json')
-    
-    setting_path = os.path.join(setting_folder_path, 'deepfluoro_task_setting.json')
-    assert os.path.isfile(setting_path), "Setting file is not found."
-    setting = pars.ParameterDict()
-    setting.load_JSON(setting_path)
-
     # Update setting file with command input
     setting["dataset"]["data_path"] = data_path if data_path is not None else setting["dataset"]["data_path"]
     setting["dataset"]["val_data_path"] = val_data_path if val_data_path is not None else setting["dataset"]["val_data_path"]
@@ -76,7 +63,8 @@ def prepare(args):
 
     task_output_path = os.path.join(exp_folder_path, 'cur_task_setting.json')
     setting.write_ext_JSON(task_output_path)
-
+    setting_path = os.path.join(exp_folder_path, 'cur_task_setting.json')
+    assert os.path.isfile(setting_path), "Setting file is not found."
     # Make the setting file read-only
     os.chmod(task_output_path, S_IREAD)
 
@@ -84,7 +72,7 @@ def prepare(args):
         mermaid_backup_json_path = os.path.join(exp_folder_path, 'mermaid_nonp_settings.json')
         mermaid_setting_json = setting['train']['model']['mermaid_net_json_pth']
         if len(mermaid_setting_json) == 0:
-            mermaid_setting_json = os.path.join(setting_folder_path, 'mermaid_nonp_settings.json')
+            mermaid_setting_json = os.path.join(exp_folder_path, 'mermaid_nonp_settings.json')
         mermaid_setting = pars.ParameterDict()
         mermaid_setting.load_JSON(mermaid_setting_json)
         mermaid_setting.write_ext_JSON(mermaid_backup_json_path)
@@ -107,12 +95,12 @@ if __name__ == '__main__':
     import argparse
 
     parser = argparse.ArgumentParser(description="An easy interface for training registration models")
-    parser.add_argument('-o','--output_path', required=True, type=str,
+    parser.add_argument('-o','--output_path', required=False, type=str,
                         default=None,help='the path of output folder')
-    parser.add_argument('-d','--data_path', required=True, type=str,
-                        default='',help='the path to the data folder')
-    parser.add_argument('-v','--val_data_path', required=True, type=str,
-                        default='',help='the path to the validation data folder')
+    parser.add_argument('-d','--data_path', required=False, type=str,
+                        default=None,help='the path to the data folder')
+    parser.add_argument('-v','--val_data_path', required=False, type=str,
+                        default=None,help='the path to the validation data folder')
     parser.add_argument('-e','--exp_name', required=True, type=str,
                         default=None,help='the name of the experiment')
     parser.add_argument('-s','--setting_path', required=True, type=str,

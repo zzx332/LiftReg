@@ -86,7 +86,7 @@ class FluoroDataset2D(Dataset):
 
     def _init_projector_if_needed(self):
         if not hasattr(self, "_siddon") or self._siddon is None:
-            self._siddon = Siddon(voxel_shift=0.0)
+            self._siddon = Siddon(voxel_shift=0.5)
         if not hasattr(self, "_detector") or self._detector is None:
             self._detector = Detector(
                 1020.0,

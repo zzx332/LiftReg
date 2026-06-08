@@ -12,7 +12,6 @@ import numpy as np
 import SimpleITK as sitk
 import torch
 import torch.nn.functional as F
-import torchio
 from diffdrr.detector import Detector
 from diffdrr.pose import RigidTransform
 from diffdrr.renderers import Siddon
@@ -20,15 +19,12 @@ from torchio import LabelMap, ScalarImage
 from scipy.spatial.transform import Rotation
 from utils.dicom_to_extrinsic import collect_dsa_mhd_info
 
-DATASET_TYPE = "dataset_2"
+DATASET_TYPE = "dataset_4"
 INTENSITY_OFFSET = True
 DATA_PATH = f"/data/zhouzhexin/20260521/3D2D_{DATASET_TYPE}"
 OUTPUT_DIR = os.path.join(DATA_PATH, "drr_generated")
 TARGET_SPACING = (2.2, 2.2, 2.2)
 TARGET_SIZE = (160, 160, 160)
-# TARGET_SPACING = (1.1, 1.1, 1.1)
-# TARGET_SIZE = (320, 320, 320)
-
 # 与 FluoroDataset 保持一致
 REORIENT = torch.tensor(
     [
@@ -142,9 +138,9 @@ def make_renderer(
     detector_width: int,
     detector_height: int,
     dx: float,
-    dy: float,
+    dy: float,  
 ) -> Tuple[Siddon, Detector]:
-    siddon = Siddon(voxel_shift=0.0)
+    siddon = Siddon(voxel_shift=0.5)
     detector = Detector(
         float(sdd),
         int(detector_width),
@@ -347,6 +343,67 @@ class path_finder:
         self.rigid_case_name = f"{ct_patient_name}_DSA_{case_name}-CT_{ct_patient_name}_CT_{ct_file_name}"
         self.res_file_name = f"{ct_patient_name}-{case_name}-{ct_file_name}"
 
+def preprocess_for_TipsDataset3D(info_dict):
+    ct_mhd_path = info_dict["ct_mhd_path"]
+    base_output_path = info_dict["base_output_path"]
+    ct_patient_name = info_dict["ct_patient_name"]
+    ct_file_name = info_dict["ct_file_name"]
+    rigid_case_name = info_dict["rigid_case_name"]
+    extrinsic = info_dict["extrinsic"]
+    df = info_dict["df"]
+    res_path = info_dict["res_path"]
+    res_file_name = info_dict["res_file_name"]
+    # os.makedirs(base_output_path, exist_ok=True)
+    output_path = os.path.join(base_output_path, ct_patient_name)
+    os.makedirs(output_path, exist_ok=True)
+    img = sitk.ReadImage(ct_mhd_path)
+    arr = sitk.GetArrayFromImage(img)
+    arr = arr - 1024.0
+    arr = np.where(arr > 2048, 2048.0, arr)
+    new_img = sitk.GetImageFromArray(arr)
+    new_img.CopyInformation(img)
+    output_nii_path = os.path.join(output_path, ct_file_name + "_volume.nii.gz")
+    sitk.WriteImage(new_img, output_nii_path)
+    dsa_img = sitk.ReadImage(os.path.join(res_path, res_file_name + "-DSA.mhd"))
+    dsa_img = resize_sitk_2d_to(dsa_img, 512, 512)
+    sitk.WriteImage(dsa_img, os.path.join(output_path, res_file_name + "-DSA.mhd"))
+
+    rigid_param = get_rigid_param_by_case(rigid_case_name, df)
+    extrinsic_world2cam = torch.as_tensor(extrinsic, dtype=torch.float32)
+    extrinsic_cam2world = torch.inverse(extrinsic_world2cam)
+    meta_pt_path = os.path.join(output_path, f"{rigid_case_name}_meta.pt")
+    meta_json_path = os.path.join(output_path, f"{rigid_case_name}_meta.json")
+    payload = {
+        "rigid_param": [float(x) for x in rigid_param],  # 6 params
+        "extrinsic_cam2world": extrinsic_cam2world
+    }
+    # 1) 适合后续程序读取
+    torch.save(payload, meta_pt_path)
+    # 2) 适合人工查看
+    with open(meta_json_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "rigid_param": payload["rigid_param"],
+                "extrinsic_cam2world": payload["extrinsic_cam2world"].tolist(),
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    print(f"Generated TipsDataset3D for {ct_patient_name}")
+
+def resize_sitk_2d_to(img, out_w=512, out_h=512, interpolator=sitk.sitkLinear):
+    in_size = img.GetSize()       # (nx, ny)
+    in_spacing = img.GetSpacing() # (sx, sy)
+    out_spacing = (
+        in_spacing[0] * in_size[0] / float(out_w),
+        in_spacing[1] * in_size[1] / float(out_h),
+    )
+    ref = sitk.Image(int(out_w), int(out_h), img.GetPixelID())
+    ref.SetOrigin(img.GetOrigin())
+    ref.SetDirection(img.GetDirection())
+    ref.SetSpacing(out_spacing)
+    return sitk.Resample(img, ref, sitk.Transform(), interpolator, 0.0, img.GetPixelIDValue())
 def main() -> None:
     # os.makedirs(OUTPUT_DIR, exist_ok=True)
     records: List[Dict] = collect_dsa_mhd_info(DATA_PATH, if_save=False)
@@ -367,8 +424,8 @@ def main() -> None:
     for rec in records:
         case_name = rec.get("case_name")
         ct_patient_name = rec.get("ct_patient_name", case_name.split("_")[0])
-        # if ct_patient_name != "HE_XIN_RONG":
-        #     continue
+        if ct_patient_name != "DUAN_ZHI_DONG":
+            continue
         extrinsic = rec.get("extrinsic")
         if not case_name or extrinsic is None:
             skipped.append({"case_name": case_name, "reason": "missing_case_or_extrinsic"})
@@ -392,7 +449,9 @@ def main() -> None:
 
         case_dir = os.path.join(DATA_PATH, ct_patient_name)
         # data_set2: ct_patient_name + "_A_CT_us", dataset_3: "data_CT_01_us", dataset_4: "data_CT_02"
-        if DATASET_TYPE == "dataset_2":
+        if DATASET_TYPE == "dataset_1":
+            ct_file_name = "data"
+        elif DATASET_TYPE == "dataset_2":
             ct_file_name = ct_patient_name + "_A_CT_us"
         elif DATASET_TYPE == "dataset_3":
             ct_file_name = "data_CT_01_us"
@@ -401,12 +460,33 @@ def main() -> None:
         else:
             skipped.append({"case_name": case_name, "reason": "invalid_dataset_type"})
             continue
-        ct_mhd_path = os.path.join(DATA_PATH, ct_patient_name, "CT", ct_file_name + ".mhd")
+        # ct_mhd_path = os.path.join(DATA_PATH, ct_patient_name, "CT", ct_file_name + ".mhd")
+        ct_root = Path(DATA_PATH) / ct_patient_name / "CT"
+        matches = sorted(ct_root.rglob(ct_file_name + ".mhd"))
+        ct_mhd_path = matches[0] if matches else None
         rigid_case_name = f"{ct_patient_name}_DSA_{case_name}-CT_{ct_patient_name}_CT_{ct_file_name}"
         res_file_name = f"{ct_patient_name}-{case_name}-{ct_file_name}"
+        if DATASET_TYPE == "dataset_1":
+            rigid_case_name = ct_patient_name
+            res_file_name = ct_patient_name
         if ct_mhd_path is None:
             skipped.append({"case_name": case_name, "reason": "missing_ct_mhd"})
             continue
+        info_dict = {
+            "base_output_path": "/home/zzx/data/tips_dataset3d",
+            "ct_mhd_path": ct_mhd_path,
+            "ct_patient_name": ct_patient_name,
+            "ct_file_name": ct_file_name,
+            "rigid_case_name": rigid_case_name,
+            "res_path": res_path,
+            "res_file_name": res_file_name,
+            "extrinsic": extrinsic,
+            "df": df,
+        }
+        # 1) mhd -> nii.gz
+        # preprocess_for_TipsDataset3D(info_dict)
+
+        # continue
 
         seg_path = find_seg_nii(case_dir)
 
@@ -431,18 +511,6 @@ def main() -> None:
         drr_np = np.flip(drr_np, axis=1)
         drr_np = drr_np[0, :, :]
         drr_img = sitk.GetImageFromArray(drr_np)
-        def resize_sitk_2d_to(img, out_w=512, out_h=512, interpolator=sitk.sitkLinear):
-            in_size = img.GetSize()       # (nx, ny)
-            in_spacing = img.GetSpacing() # (sx, sy)
-            out_spacing = (
-                in_spacing[0] * in_size[0] / float(out_w),
-                in_spacing[1] * in_size[1] / float(out_h),
-            )
-            ref = sitk.Image(int(out_w), int(out_h), img.GetPixelID())
-            ref.SetOrigin(img.GetOrigin())
-            ref.SetDirection(img.GetDirection())
-            ref.SetSpacing(out_spacing)
-            return sitk.Resample(img, ref, sitk.Transform(), interpolator, 0.0, img.GetPixelIDValue())
         dsa_img = sitk.ReadImage(os.path.join(res_path, res_file_name + "-DSA.mhd"))
         dsa_img = resize_sitk_2d_to(dsa_img, 512, 512)
         # drr_img.CopyInformation(dsa_img)

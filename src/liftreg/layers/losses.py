@@ -122,3 +122,105 @@ class NGFLoss(torch.nn.Module):
         g = torch.stack([g_x, g_y], dim=-1)
         g = g/torch.sqrt(torch.sum(g**2, dim=-1, keepdim=True)+self.eps)
         return g
+
+
+class GradientDifference(nn.Module):
+    """Gradient Difference similarity (Penney et al., 1998).
+
+    Designed for 2D-3D X-ray / DRR registration. Instead of comparing
+    intensities (which differ across modalities and where one image contains
+    structures the other lacks, e.g. contrast-filled vessels in DSA), it
+    compares image gradients via
+
+        G = mean( Av / (Av + Dv^2) ) + mean( Ah / (Ah + Dh^2) )
+
+    where Dv = dV(fixed) - s * dV(moving), Dh = dH(fixed) - s * dH(moving),
+    and Av, Ah are constants (here the variance of the fixed-image gradients).
+    The 1/(A + d^2) form suppresses large gradient differences, making the
+    measure robust to structures present in only one modality.
+
+    forward(y_true, y_pred): both [B, 1, H, W]; returns a scalar in ~[-1, 0]
+    (lower is better; -1 = perfectly aligned gradients).
+    """
+
+    def __init__(self, s=1.0, eps=1e-6):
+        super(GradientDifference, self).__init__()
+        self.s = s
+        self.eps = eps
+
+    @staticmethod
+    def _grads(x):
+        gh = F.pad(x[:, :, 1:, :] - x[:, :, :-1, :], (0, 0, 0, 1))  # d/dH
+        gw = F.pad(x[:, :, :, 1:] - x[:, :, :, :-1], (0, 1, 0, 0))  # d/dW
+        return gh, gw
+
+    def forward(self, y_true, y_pred):
+        gh_f, gw_f = self._grads(y_true)
+        gh_m, gw_m = self._grads(y_pred)
+
+        s = self.s
+        if s is None:
+            # Adaptive scale matching gradient magnitudes (Penney): s = <g_f, g_m> / <g_m, g_m>
+            num = (gh_f * gh_m).sum() + (gw_f * gw_m).sum()
+            den = (gh_m * gh_m).sum() + (gw_m * gw_m).sum() + self.eps
+            s = (num / den).detach()
+
+        Dv = gw_f - s * gw_m
+        Dh = gh_f - s * gh_m
+
+        # Constants A: variance of the fixed-image gradients (per call, stable scalar).
+        Av = gw_f.var().clamp_min(self.eps)
+        Ah = gh_f.var().clamp_min(self.eps)
+
+        Gv = Av / (Av + Dv * Dv)
+        Gh = Ah / (Ah + Dh * Dh)
+
+        return -0.5 * (Gv.mean() + Gh.mean())
+
+
+class PatternIntensity(nn.Module):
+    """Pattern Intensity similarity (Penney et al., 1998 / Weese et al.).
+
+    Operates on the difference image Idiff = fixed - s * moving. Within a
+    neighborhood of radius r, it accumulates
+
+        P = mean over offsets d of  sigma^2 / (sigma^2 + (Idiff(x) - Idiff(x+d))^2)
+
+    Aligned images yield a flat difference image (small local variations) and
+    thus a high P. The sigma^2/(sigma^2 + .) form makes it robust to structures
+    that appear in only one modality (e.g. DSA contrast, bowel gas) because such
+    large local differences contribute little. Higher P = better alignment, so
+    the returned loss is -P.
+
+    forward(y_true, y_pred): both [B, 1, H, W]; returns a scalar in ~[-1, 0].
+    """
+
+    def __init__(self, radius=3, sigma=0.5, s=1.0):
+        super(PatternIntensity, self).__init__()
+        self.radius = int(radius)
+        self.sigma2 = float(sigma) ** 2
+        self.s = s
+        # Precompute neighborhood offsets within the radius (excluding center).
+        offsets = []
+        r = self.radius
+        for di in range(-r, r + 1):
+            for dj in range(-r, r + 1):
+                if 0 < di * di + dj * dj <= r * r:
+                    offsets.append((di, dj))
+        self.offsets = offsets
+
+    def forward(self, y_true, y_pred):
+        idiff = y_true - self.s * y_pred  # [B, 1, H, W]
+        sigma2 = self.sigma2
+
+        acc = 0.0
+        for di, dj in self.offsets:
+            # Shift idiff by (di, dj) using pad+crop so there is no wrap-around;
+            # the overlapping region is compared, borders are zero-padded which
+            # contributes ~1 (aligned) and is negligible for small radius.
+            shifted = torch.roll(idiff, shifts=(di, dj), dims=(2, 3))
+            d = idiff - shifted
+            acc = acc + sigma2 / (sigma2 + d * d)
+
+        pattern = acc / max(len(self.offsets), 1)
+        return -pattern.mean()

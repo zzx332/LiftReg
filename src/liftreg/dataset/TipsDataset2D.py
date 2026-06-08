@@ -42,6 +42,26 @@ def identifier_from_drr_filename(filename: str) -> str:
     return filename[: -len(_DRR_SUFFIX)]
 
 
+def _read_optional_option(option, key):
+    """Read key without triggering ParameterDict auto-creation (default None -> {})."""
+    if hasattr(option, "ext") and key in option.ext:
+        return option.ext[key]
+    return None
+
+
+def _normalize_split_list_cfg(cfg):
+    if cfg is None:
+        return None
+    if isinstance(cfg, str):
+        s = cfg.strip()
+        return s if s else None
+    if isinstance(cfg, dict):
+        return cfg if cfg else None
+    if hasattr(cfg, "ext") and isinstance(cfg.ext, dict):
+        return cfg.ext if cfg.ext else None
+    raise ValueError(f"split_list_json must be str or dict, got {type(cfg)}")
+
+
 class TipsDataset2D(Dataset):
     """
     2D DRR + 2D X-ray registration dataset.
@@ -64,7 +84,7 @@ class TipsDataset2D(Dataset):
 
         self.phase = phase
         self.transform = transform
-        self.cache_version = 2
+        self.cache_version = 4
 
         ind = ["train", "val", "test", "debug"].index(phase)
         max_num = option[("max_num_for_loading", (-1, -1, -1, -1), "max pairs to load per split")]
@@ -104,15 +124,18 @@ class TipsDataset2D(Dataset):
              [0, 0, 0, 1]], dtype=torch.float32)
         self.detector_spacing = option[("detector_spacing", 0.7255, "")]
         self.detector_width = option[("detector_width", 384, "")]
-        self.split_list_json = option[(
-            "split_list_json",
-            None,
-            "path to split json (list or manifest); None -> {data_path}/{phase}_list.json",
-        )]
+        self.split_list_json = _normalize_split_list_cfg(
+            _read_optional_option(option, "split_list_json")
+        )
+        load_into_memory = _read_optional_option(option, "load_training_data_into_memory")
+        self.load_into_memory = bool(load_into_memory) and (phase == "train")
+        self.memory_pool = {}
 
         self.identifier_list = []
         self.get_identifier_list()
         self.init_img_pool()
+        if self.load_into_memory:
+            self._load_memory_pool()
 
     def _default_split_list_path(self):
         list_name = _PHASE_LIST_FILES.get(self.phase)
@@ -128,10 +151,8 @@ class TipsDataset2D(Dataset):
                 path = cfg.get(self.phase)
                 if path:
                     return path
-            elif isinstance(cfg, str):
-                return cfg
             else:
-                raise ValueError(f"split_list_json must be str or dict, got {type(cfg)}")
+                return cfg
         return self._default_split_list_path()
 
     def _identifiers_from_json_payload(self, data):
@@ -201,7 +222,7 @@ class TipsDataset2D(Dataset):
 
     def _init_projector_if_needed(self):
         if not hasattr(self, "_siddon") or self._siddon is None:
-            self._siddon = Siddon(voxel_shift=0.0)
+            self._siddon = Siddon(voxel_shift=0.5)
         if not hasattr(self, "_detector") or self._detector is None:
             self._detector = Detector(
                 1020.0,
@@ -385,7 +406,8 @@ class TipsDataset2D(Dataset):
         else:
             source_mask = None
         source_proj = self._preprocess_xray(source_proj, crop=0, linearize=False, mask=mask)
-        target_proj = self._preprocess_xray(target_proj, crop=0, linearize=True, mask=mask)
+        # target_proj = self._preprocess_xray(target_proj, crop=0, linearize=True, mask=mask)
+        target_proj = self._preprocess_xray(target_proj, crop=0, linearize=False, mask=mask)
         return source_proj, target_proj, source_mask
 
     def _load_warp_pose(self, identifier):
@@ -404,11 +426,13 @@ class TipsDataset2D(Dataset):
             with np.load(npz_path) as npz:
                 required_keys = {"cache_version", "source_proj", "target_proj", "spacing"}
                 if self.has_label:
-                    required_keys.add("source_seg_proj")
+                    required_keys.add("source_mask")
+                if self.provide_weights:
+                    required_keys.add("weights")
                 if self.offline_aug_variants > 0:
                     required_keys.update({"aug_source_proj", "aug_target_proj", "aug_affines"})
                     if self.has_label:
-                        required_keys.add("aug_source_seg_proj")
+                        required_keys.add("aug_source_mask")
                 if not required_keys.issubset(set(npz.files)):
                     return False
 
@@ -457,6 +481,76 @@ class TipsDataset2D(Dataset):
     def _prepare_label_projection_stack(self, proj):
         proj = (np.ascontiguousarray(proj.astype(np.float32)).astype(np.float32))
         return np.ascontiguousarray(self._resize_projection_stack(proj, mode="nearest"))
+
+    @staticmethod
+    def _fallback_source_mask_from_proj(source_proj_np, threshold=1e-6):
+        return np.ascontiguousarray((source_proj_np > threshold).astype(np.uint8))
+
+    def _load_cached_source_mask(self, npz, source_proj):
+        if not self.has_label:
+            return None
+        if "source_mask" not in npz.files:
+            return self._fallback_source_mask_from_proj(source_proj)
+        arr = npz["source_mask"]
+        if arr.dtype == np.dtype("O"):
+            return self._fallback_source_mask_from_proj(source_proj)
+        return np.ascontiguousarray(arr.astype(np.uint8))
+
+    def _compute_segment_weights(self, lab2d):
+        """Return (K, H, W) float32 polyrigid blending weights for a 2D label map."""
+        if lab2d.ndim == 3:
+            lab2d = lab2d[0]
+        try:
+            _, weights = compute_weights_2d(
+                lab2d,
+                labels=self.label_groups,
+                weightfn=self.weightfn,
+                normalize=True,
+            )
+        except ValueError:
+            weights = torch.full(
+                (max(self.num_segments, 1), int(lab2d.shape[-2]), int(lab2d.shape[-1])),
+                1.0 / max(self.num_segments, 1),
+                dtype=torch.float32,
+            )
+        weights = self._pad_or_truncate_weights(weights, self.num_segments)
+        return np.ascontiguousarray(weights.numpy().astype(np.float32))
+
+    def _read_cached_sample(self, identifier):
+        """Load preprocessed arrays from disk cache (npz)."""
+        npz_path = os.path.join(self.cache_dir, f"{identifier}.npz")
+        with np.load(npz_path) as npz:
+            source_proj = np.ascontiguousarray(npz["source_proj"].astype(np.float32))
+            target_proj = np.ascontiguousarray(npz["target_proj"].astype(np.float32))
+            spacing = np.ascontiguousarray(npz["spacing"].astype(np.float32))
+            source_mask = self._load_cached_source_mask(npz, source_proj)
+            weights = None
+            if self.provide_weights and "weights" in npz.files:
+                weights = np.ascontiguousarray(npz["weights"].astype(np.float32))
+        record = {
+            "source_proj": source_proj,
+            "target_proj": target_proj,
+            "spacing": spacing,
+        }
+        if self.has_label and source_mask is not None:
+            record["source_mask"] = source_mask
+        if weights is not None:
+            record["weights"] = weights
+        return record
+
+    def _load_memory_pool(self):
+        print(
+            f"[{self.phase}] Loading {len(self.identifier_list)} cached samples into memory..."
+        )
+        pbar = pb.ProgressBar(
+            widgets=[pb.Percentage(), pb.Bar(), pb.ETA()],
+            maxval=len(self.identifier_list),
+        ).start()
+        for i, identifier in enumerate(self.identifier_list):
+            self.memory_pool[identifier] = self._read_cached_sample(identifier)
+            pbar.update(i + 1)
+        pbar.finish()
+        print(f"[{self.phase}] memory_pool ready ({len(self.memory_pool)} samples)")
 
     def _build_offline_augmented_bank(
         self,
@@ -550,22 +644,32 @@ class TipsDataset2D(Dataset):
 
         self._init_projector_if_needed()
         source_proj, target_proj, source_mask = self._load_data(identifier)
-        target_proj_np = self._prepare_projection_stack(target_proj.astype(np.float32))
+        target_proj_np = self._prepare_projection_stack(target_proj)
+        source_proj_np = self._prepare_projection_stack(
+            source_proj
+        )
         if source_mask is not None:
             source_mask_np = self._prepare_label_projection_stack(source_mask)
+        elif self.has_label:
+            source_mask_np = self._fallback_source_mask_from_proj(source_proj_np)
         else:
             source_mask_np = None
-        source_proj_np = self._prepare_projection_stack(
-            source_proj.astype(np.float32)
-        )
 
         save_dict = {
             "cache_version": np.array([self.cache_version], dtype=np.int16),
             "source_proj": source_proj_np,
             "target_proj": target_proj_np,
             "spacing": np.array(self.spacing, dtype=np.float32),
-            "source_mask": source_mask_np,
         }
+        if self.has_label:
+            save_dict["source_mask"] = np.ascontiguousarray(
+                source_mask_np.astype(np.uint8)
+            )
+        if self.provide_weights:
+            lab2d = source_mask_np
+            if lab2d.ndim == 3:
+                lab2d = lab2d[0]
+            save_dict["weights"] = self._compute_segment_weights(lab2d)
 
         np.savez_compressed(npz_path, **save_dict)
 
@@ -837,12 +941,30 @@ class TipsDataset2D(Dataset):
         idx = idx % len(self.identifier_list)
         identifier = self.identifier_list[idx]
 
-        with np.load(os.path.join(self.cache_dir, f"{identifier}.npz")) as npz:
-            source_proj = np.ascontiguousarray(npz["source_proj"].astype(np.float32))
-            target_proj = np.ascontiguousarray(npz["target_proj"].astype(np.float32))
-            spacing = np.ascontiguousarray(npz["spacing"].astype(np.float32))
-            source_mask = np.ascontiguousarray(npz["source_mask"].astype(np.uint8))
+        if self.load_into_memory:
+            rec = self.memory_pool[identifier]
+            source_proj = rec["source_proj"].copy()
+            target_proj = rec["target_proj"].copy()
+            spacing = rec["spacing"].copy()
+            source_mask = (
+                rec["source_mask"].copy()
+                if self.has_label and "source_mask" in rec
+                else None
+            )
+            cached_weights = (
+                rec["weights"].copy()
+                if self.provide_weights and "weights" in rec
+                else None
+            )
+        else:
+            rec = self._read_cached_sample(identifier)
+            source_proj = rec["source_proj"]
+            target_proj = rec["target_proj"]
+            spacing = rec["spacing"]
+            source_mask = rec.get("source_mask")
+            cached_weights = rec.get("weights")
 
+        mask_changed_by_aug = False
         if self.enable_aug:
             label_for_aug = source_mask if self.has_label else None
             source_proj, target_proj, label_aug = self._build_offline_augmented_bank(
@@ -859,38 +981,34 @@ class TipsDataset2D(Dataset):
                 source_mask = np.ascontiguousarray(
                     np.rint(label_aug).clip(0, 255).astype(np.uint8)
                 )
+                mask_changed_by_aug = True
 
         sample = {
             "source_proj": source_proj,
             "target_proj": target_proj,
-            "source_label": source_mask,
             "spacing": spacing,
         }
+        if self.has_label:
+            sample["source_label"] = source_mask
 
         if self.provide_weights:
-            lab2d = source_mask
-            if lab2d.ndim == 3:
-                lab2d = lab2d[0]
-            try:
-                _, weights = compute_weights_2d(
-                    lab2d,
-                    labels=self.label_groups,
-                    weightfn=self.weightfn,
-                    normalize=True,
-                )
-            except ValueError:
-                # Empty / all-zero label fallback: uniform weights across K segments
-                weights = torch.full(
-                    (max(self.num_segments, 1), int(lab2d.shape[-2]), int(lab2d.shape[-1])),
-                    1.0 / max(self.num_segments, 1),
-                    dtype=torch.float32,
-                )
-            weights = self._pad_or_truncate_weights(weights, self.num_segments)
-            sample["weights"] = weights.numpy().astype(np.float32)
+            if mask_changed_by_aug:
+                lab2d = source_mask
+                if lab2d.ndim == 3:
+                    lab2d = lab2d[0]
+                sample["weights"] = self._compute_segment_weights(lab2d)
+            elif cached_weights is not None:
+                sample["weights"] = cached_weights.copy()
+            else:
+                lab2d = source_mask
+                if lab2d is not None and lab2d.ndim == 3:
+                    lab2d = lab2d[0]
+                sample["weights"] = self._compute_segment_weights(lab2d)
 
         if self.transform:
             sample["source_proj"] = self.transform(sample["source_proj"])
-            sample["source_label"] = self.transform(sample["source_label"])
+            if self.has_label:
+                sample["source_label"] = self.transform(sample["source_label"])
         return sample, identifier
 
     @staticmethod

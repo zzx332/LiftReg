@@ -101,16 +101,21 @@ class RegNet2D(nn.Module):
 
         # ===== Output head =====
         if self.use_polyrigid:
-            # Polyrigid head: global pool → FC → per-segment 2D translations
-            self.global_pool = nn.AdaptiveAvgPool2d(1)
+            # Polyrigid head: per-segment masked ROI pooling → shared FC →
+            # per-segment se(2) log parameters (omega, v_row, v_col). Each segment
+            # aggregates features only from its own region (via blending weights),
+            # which preserves spatial localization and avoids the gradient dilution
+            # of global avg pooling. The 3 outputs are a 2D rigid (rotation +
+            # translation) in the Lie algebra; they are log-mixed across segments
+            # and exponentiated per pixel (Log-Euclidean polyrigid).
+            self.pool_norm = nn.LayerNorm(dec_channels[-1])
             self.fc_polyrigid = nn.Sequential(
-                nn.Flatten(),
                 nn.Linear(dec_channels[-1], 128),
                 nn.ReLU(inplace=True),
-                nn.Linear(128, self.num_segments * 2),  # 2D translation per segment
+                nn.Linear(128, 3),  # se(2) log per segment, applied over (B,K,C)
             )
-            # Small-weight init so initial displacement is near zero
-            self.fc_polyrigid[-1].weight.data.normal_(mean=0.0, std=0.1)
+            # Larger init std (vs 0.1) so the head escapes the near-zero dead zone.
+            self.fc_polyrigid[-1].weight.data.normal_(mean=0.0, std=0.3)
             self.fc_polyrigid[-1].bias.data.zero_()
         elif self.use_velocity:
             # Stationary velocity field head (integrated via scaling-and-squaring)
@@ -166,23 +171,79 @@ class RegNet2D(nn.Module):
         return phi
 
     @staticmethod
-    def _polyrigid_to_displacement(polyrigid_params, weights):
-        """
-        Pure-translation polyrigid: weighted sum of per-segment 2D translation vectors.
+    def _masked_pool(features, weights, eps=1e-6):
+        """Per-segment masked (weighted) average pooling.
 
-        Each pixel's displacement = sum_k( w_k * t_k ), where t_k is the predicted
-        translation for segment k and w_k is its segmentation weight at that pixel.
+        Aggregates decoder features within each segment's region so every
+        segment gets its own feature vector. The normalization denominator is
+        the segment's mass (<< H*W), so gradients are not diluted across the
+        whole image the way global average pooling dilutes them.
 
         Args:
-            polyrigid_params: (B, K, 2) predicted 2D translation per segment (pixel units)
-            weights:          (B, K, H, W) segmentation blending weights
+            features: (B, C, H, W) decoder feature map
+            weights:  (B, K, H, W) per-pixel segment blending weights
 
         Returns:
-            disp_field: (B, 2, H, W) dense pixel-unit displacement field
+            pooled: (B, K, C) one feature vector per segment
         """
-        # weights: (B, K, H, W)   polyrigid_params: (B, K, 2)
-        # result:  (B, 2, H, W)
-        disp_field = torch.einsum("bkhw,bkn->bnhw", weights, polyrigid_params)
+        # numerator: sum over space of feature * weight, per (segment, channel)
+        num = torch.einsum("bchw,bkhw->bkc", features, weights)
+        den = weights.sum(dim=(-1, -2)).clamp_min(eps).unsqueeze(-1)  # (B, K, 1)
+        return num / den
+
+    def _polyrigid_to_displacement(self, polyrigid_params, weights, eps=1e-6):
+        """
+        Log-Euclidean 2D polyrigid: blend per-segment se(2) logs, then exp per pixel.
+
+        Following polypose's PolyRigid (but in 2D), each segment k carries a se(2)
+        Lie-algebra element xi_k = (omega_k, v_row_k, v_col_k). These are averaged
+        in the log space with the per-pixel blending weights, and the resulting
+        per-pixel se(2) element is mapped to SE(2) via the exponential map. The
+        rigid transform is applied about the image center so that omega=0 reduces
+        exactly to the previous pure-translation behavior.
+
+        Args:
+            polyrigid_params: (B, K, 3) per-segment se(2) log [omega, v_row, v_col]
+            weights:          (B, K, H, W) segmentation blending weights (sum 1 over K)
+
+        Returns:
+            disp_field: (B, 2, H, W) dense pixel-unit displacement field (row, col)
+        """
+        H, W = weights.shape[-2:]
+
+        # 1) Log-space weighted average -> per-pixel se(2) element (B, 3, H, W).
+        xi = torch.einsum("bkhw,bkn->bnhw", weights, polyrigid_params)
+        # theta = xi[:, 0]          # (B, H, W) rotation angle
+        theta = torch.zeros_like(xi[:, 0])   # 关闭旋转 -> 纯平移
+        v_row = xi[:, 1]          # (B, H, W) translation log (row)
+        v_col = xi[:, 2]          # (B, H, W) translation log (col)
+
+        cos = torch.cos(theta)
+        sin = torch.sin(theta)
+
+        # 2) SE(2) exponential: translation t = V(theta) @ v, with V the left
+        #    Jacobian. Use Taylor expansion near theta=0 for numerical stability.
+        small = theta.abs() < eps
+        theta_safe = torch.where(small, torch.ones_like(theta), theta)
+        a = torch.where(small, 1.0 - theta * theta / 6.0, sin / theta_safe)        # sinθ/θ
+        b = torch.where(small, theta / 2.0, (1.0 - cos) / theta_safe)              # (1-cosθ)/θ
+        t_row = a * v_row - b * v_col
+        t_col = b * v_row + a * v_col
+
+        # 3) Rotate the identity grid about the image center, then translate.
+        #    flow = (R - I) @ (x - c) + t  ->  omega=0 gives flow = t (pure shift).
+        grid = self.transformer.grid.to(theta.device)  # (1, 2, H, W) identity (row, col)
+        cy = (H - 1) / 2.0
+        cx = (W - 1) / 2.0
+        d_row = grid[:, 0] - cy   # (1, H, W), broadcasts over batch
+        d_col = grid[:, 1] - cx
+
+        rot_row = cos * d_row - sin * d_col
+        rot_col = sin * d_row + cos * d_col
+
+        flow_row = rot_row - d_row + t_row
+        flow_col = rot_col - d_col + t_col
+        disp_field = torch.stack([flow_row, flow_col], dim=1)  # (B, 2, H, W)
         return disp_field
 
     def forward(self, input_dict):
@@ -200,15 +261,14 @@ class RegNet2D(nn.Module):
         polyrigid_params = None
         velocity = None
         if self.use_polyrigid:
-            B = source.shape[0]
-            # Predict per-segment 2D translations
-            pooled = self.global_pool(features)
-            raw = self.fc_polyrigid(pooled)                   # (B, K*2)
-            polyrigid_params = raw.view(B, self.num_segments, 2)  # (B, K, 2)
-
-            # Build dense displacement from segmentation weights
             # Expects input_dict['weights'] of shape (B, K, H, W)
             seg_weights = input_dict['weights'].to(source.device)
+            # Masked ROI pooling: per-segment feature vector from its own region.
+            pooled = self._masked_pool(features, seg_weights)  # (B, K, C)
+            pooled = self.pool_norm(pooled)                    # stabilize FC input
+            polyrigid_params = self.fc_polyrigid(pooled)       # (B, K, 3) se(2) log
+
+            # Build dense displacement from segmentation weights
             flow = self._polyrigid_to_displacement(polyrigid_params, seg_weights)
         elif self.use_velocity:
             velocity = self.velocity_conv(features)  # [B, 2, H, W]
@@ -226,7 +286,7 @@ class RegNet2D(nn.Module):
         }
 
         if self.use_polyrigid:
-            output['polyrigid_params'] = polyrigid_params  # (B, K, 2)
+            output['polyrigid_params'] = polyrigid_params  # (B, K, 3) se(2) log
         if self.use_velocity:
             output['velocity'] = velocity  # (B, 2, H, W) stationary velocity field
         

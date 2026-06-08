@@ -267,6 +267,7 @@ def make_centered_volume_xyz(D, H, W, device, spacing=(1.,1.,1.), origin=(0.,0.,
 
 def backproj_grids_with_SOUV(
     img_shape,               # (D,H,W,3) 体素点世界坐标
+    spacing,
     S, O, U, V,        # (B,P,3)
     proj_w, proj_h,
     du, dv,            # 标量 或 (B,P) / (B,P,1)
@@ -275,7 +276,7 @@ def backproj_grids_with_SOUV(
     device=torch.device("cpu")):
     B, P, _ = S.shape
     D, H, W = img_shape
-    xyz = make_centered_volume_xyz(D, H, W, device, spacing=(2.2, 2.2, 2.2))
+    xyz = make_centered_volume_xyz(D, H, W, device, spacing=spacing)
     if cu is None: cu = (proj_w - 1) / 2.0
     if cv is None: cv = (proj_h - 1) / 2.0
 

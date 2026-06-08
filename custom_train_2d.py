@@ -67,7 +67,30 @@ class RegTrainer2D:
             print(f"[info] RegNet2D velocity (SVF) mode enabled (T={int_steps})")
         self.model = get_class(train_setting['model_class'])(**model_kwargs).to(self.device)
         self.loss = get_class(train_setting['loss_class'])(train_setting['loss']).to(self.device)
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=train_setting['optim']['lr'])
+        base_lr = train_setting['optim']['lr']
+        if use_polyrigid:
+            # Give the polyrigid head (masked-pool FC + its LayerNorm) a larger LR
+            # to counteract the small gradients reaching it. head_lr_mult is configurable.
+            head_lr_mult = float(train_setting['optim'][
+                ('polyrigid_head_lr_mult', 10.0, 'LR multiplier for the polyrigid head')
+            ])
+            head_prefixes = ('fc_polyrigid', 'pool_norm')
+            head_params, base_params = [], []
+            for name, param in self.model.named_parameters():
+                if name.startswith(head_prefixes):
+                    head_params.append(param)
+                else:
+                    base_params.append(param)
+            self.optimizer = torch.optim.Adam(
+                [
+                    {"params": base_params, "lr": base_lr},
+                    {"params": head_params, "lr": base_lr * head_lr_mult},
+                ]
+            )
+            print(f"[info] polyrigid head LR = {base_lr * head_lr_mult:g} "
+                  f"(x{head_lr_mult:g}), base LR = {base_lr:g}")
+        else:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=base_lr)
         self.writer = SummaryWriter(self.log_path + "/" + datetime.now().strftime("%Y%m%d-%H%M%S"))
         self.start_epoch = 1
 
@@ -289,7 +312,6 @@ if __name__ == '__main__':
 
     # Setup directories
     exp_path = os.path.join(setting["train"]["output_path"], args.exp_name, datetime.now().strftime("%Y_%m_%d_%H_%M_%S"))
-    setting["train"]["output_path"] = exp_path
     make_dir(exp_path)
     make_dir(os.path.join(exp_path, "logs"))
     make_dir(os.path.join(exp_path, "checkpoints"))
@@ -301,7 +323,7 @@ if __name__ == '__main__':
     trainer = RegTrainer2D(setting=setting)
     # trainer.export_pt(exp_path)
     # 测试前向传播
-    if args.test:
+    if args.test or setting["train"]["test_forward"]:
         _ = trainer.validate(0, save_path = save_path)
         del _
         if torch.cuda.is_available():

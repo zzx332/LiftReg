@@ -15,9 +15,13 @@
             1.05
         ],
         "detector_spacing": 0.7255,
-        "detector_width": 384,
+        "detector_width": 160,
         "img_after_resize": [
             160,
+            160,
+            160
+        ],
+        "img_after_resize_2d": [
             160,
             160
         ],
@@ -35,12 +39,12 @@
             2.2
         ],
         "use_segmentation_map": true,
-        "supervise": true
+        "supervise": false
     },
     "train": {
         "check_best_model_frequency": 1,
         "dataloader": {
-            "batch_size": 1,
+            "batch_size": 2,
             "shuffle": [
                 true,
                 true,
@@ -60,25 +64,25 @@
         "gpu_ids": 0,
         "loss": {
             "sim_factor": 1,
-            "initial_reg_factor": 0.0005,
-            "min_reg_factor": 0.0005,
+            "initial_reg_factor": 0.0,
+            "min_reg_factor": 0.0,
             "reg_factor_decay_from": 2,
             "sim_class": "liftreg.layers.losses.NCCLoss",
             "vol_sim_factor": 0.5,
             "disp_factor": 0.1
         },
         "loss_class": "liftreg.losses.Subspace2DLoss.loss",
-        "mode": "test",
+        "mode": "train",
         "continue_from": null,
         "model": {
             "drr_feature_num": 1,
             "latent_dim": 56,
             "pca_path": "D:/dataset/CTA_DSA/DeepFluoro/pca",
             "use_pca": false,
-            "use_polyrigid": false,
-            "num_segments": 3
+            "use_polyrigid": true,
+            "num_segments": 1
         },
-        "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model",
+        "model_class": "liftreg.models.LiftRegDeformSubspaceBackproj_unet.model_tips3d",
         "network_class": "liftreg.networks.RegistrationNet.RegistrationNet",
         "optim": {
             "adam": {
@@ -105,7 +109,7 @@
             },
             "optim_type": "adam"
         },
-        "output_path": "/home/zzx/data/exp_liftreg",
+        "output_path": "/home/zzx/data/exp_liftreg_3d",
         "save_3d_img": false,
         "save_extra_3d_img": false,
         "save_fig": true,

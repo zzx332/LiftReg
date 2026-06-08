@@ -167,8 +167,8 @@ class model(nn.Module):
         
         self.id_transform = gen_identity_map(self.img_sz, 1.0)
         # self.backward_proj_grids = None
-        self.render = Siddon(voxel_shift=0.0)
-        reorient = torch.tensor(
+        self.render = Siddon(voxel_shift=0.5)
+        self.reorient = torch.tensor(
             [
                 [1, 0, 0, 0],
                 [0, 0, 1, 0],
@@ -177,30 +177,49 @@ class model(nn.Module):
             ],
             dtype=torch.float32,
         )
+        self.sdd = 1020.0
+        self.infer_detector_width = 384
+        self.proj_spacing = 0.7255
         self.detector = Detector(
-            1020.0,
-            384,
-            384,
-            0.7255,
-            0.7255,
+            self.sdd,
+            self.infer_detector_width,
+            self.infer_detector_width,
+            self.proj_spacing,
+            self.proj_spacing,
             0,
             0,
-            reorient,
+            self.reorient,
             reverse_x_axis=True,
             n_subsample=None,
-        ).cuda()
-        # self.detector = Detector(
-        #     1020.0,
-        #     718,
-        #     718,
-        #     0.388,
-        #     0.388,
-        #     0,
-        #     0,
-        #     reorient,
-        #     reverse_x_axis=True,
-        #     n_subsample=None,
-        # ).cuda() 
+        ).float().cuda()
+
+    @staticmethod
+    def _to_float_scalar(value):
+        if torch.is_tensor(value):
+            return float(value.detach().cpu().item())
+        return float(value)
+
+    def _batch_scalar(self, values, batch_idx, flat_index=0):
+        """Read one scalar from a collated per-sample field (0-d or 1-d)."""
+        entry = values[batch_idx]
+        if torch.is_tensor(entry) and entry.ndim > 0:
+            entry = entry.reshape(-1)[flat_index]
+        return self._to_float_scalar(entry)
+
+    def _build_detector(self, sdd, width, delx, dely, device):
+        width = int(self._to_float_scalar(width))
+        return Detector(
+            self._to_float_scalar(sdd),
+            width,
+            width,
+            self._to_float_scalar(delx),
+            self._to_float_scalar(dely),
+            0,
+            0,
+            self.reorient.to(device=device, dtype=torch.float32),
+            reverse_x_axis=True,
+            n_subsample=None,
+        ).float().to(device)
 
     def set_memory_logger(self, logger):
         self.memory_logger = logger
@@ -209,7 +228,7 @@ class model(nn.Module):
         if self.memory_logger is not None:
             self.memory_logger(stage)
 
-    def forward(self, input):
+    def load_input_params(self, input):
         moving = input['source']
         target_proj = input["target_proj"]
         target_volume = input["target_volume"]
@@ -218,66 +237,23 @@ class model(nn.Module):
             moving_cp = (moving + 1) * moving_seg - 1
         else:
             moving_cp = moving
-
-        B, _, W, H, D = moving.shape
         density = input['density']
-        target_poses = input['target_poses'].to(density.device)
-        affine_inverse = input['affine'].inverse().to(density.device)
+        target_poses = input['target_poses'].to(
+            device=density.device, dtype=torch.float32)
+        affine_inverse = input['affine'].to(
+            device=density.device, dtype=torch.float32).inverse()
 
-        coefs, disp_field = self._estimate_flow(moving, target_volume)
-        self._log_memory("model/after_estimate_flow")
+        return moving, target_proj, target_volume, moving_cp, density, target_poses, affine_inverse
 
-        if self.use_polyrigid:
-            seg_weights = input['weights'].to(density.device)
-            affine_mat = input['affine'].to(density.device)
-            disp_field = self._polyrigid_to_displacement(
-                coefs, seg_weights, affine_mat, (W, H, D))
-            self._log_memory("model/after_polyrigid_disp")
-
-        disp_norm = disp_field.clone()
-        disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))
-        disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))
-        disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))
-        deform_field = disp_norm + self.id_transform
-        self._log_memory("model/after_deform_field")
-
-        warped_moving = self.bilinear(density, deform_field)
-        self._log_memory("model/after_warp")
-
-        warped_projs = []
-        for b in range(B):
-            proj_b = self.renderer(
-                warped_moving[b, 0],
-                target_poses[b],
-                affine_inverse[b],
-            )
-            warped_projs.append(proj_b)
-        warped_proj = torch.cat(warped_projs, dim=0).view(
-            B, -1, self.detector.height, self.detector.width
-        )
-        self._log_memory("model/after_full_projection_render")
-
-        model_output = {
-            "warped_moving": warped_moving,
-            "params": disp_field,
-            "pca_coefs": coefs,
-            "target_proj": target_proj,
-            "warped_proj": warped_proj,
-        }
-        if 'warped_density_gt' in input:
-            model_output['warped_density_gt'] = input['warped_density_gt']
-        if 'displacement_gt' in input:
-            model_output['displacement_gt'] = input['displacement_gt']
-        return model_output
-        
     def renderer(self, density, target_poses, affine_inverse):
-        target_poses = RigidTransform(target_poses)
+        target_poses = RigidTransform(target_poses.float())
         source, target = self.detector(target_poses, calibration=None)
         # Initialize the image with the length of each cast ray
         img_input = (target - source).norm(dim=-1).unsqueeze(1)
         # Convert rays to voxelspace
-        source = RigidTransform(affine_inverse)(source)
-        target = RigidTransform(affine_inverse)(target)
+        affine_inverse = RigidTransform(affine_inverse.float())
+        source = affine_inverse(source)
+        target = affine_inverse(target)
         return self.render(density, source, target, img_input)
 
     def normalize_intensity(self, img, linear_clip=False, clip_range=None):
@@ -393,3 +369,119 @@ class model(nn.Module):
     
     def get_disp(self):
         return None, ""
+
+    def _preprocess_proj(self, proj, mask):
+        def robust_normalization(img, lower_percentile=1, upper_percentile=99):
+            q = torch.tensor(
+                [lower_percentile / 100.0, upper_percentile / 100.0],
+                device=img.device, dtype=img.dtype,
+            )
+            p_min, p_max = torch.quantile(img, q)
+            img_clipped = torch.clamp(img, min=p_min, max=p_max)
+            return (img_clipped - p_min) / (p_max - p_min + 1e-7)
+
+        mask = mask.to(device=proj.device, dtype=proj.dtype)
+        img_mask = proj * mask
+        return robust_normalization(img_mask)
+
+    def warp_render(self, warped_moving, target_poses, affine_inverse):
+        B, _, _, _, _ = warped_moving.shape
+        warped_projs = []
+        for b in range(B):
+            warped_proj = self.renderer(
+                warped_moving[b, 0],
+                target_poses[b],
+                affine_inverse[b],
+            ).view(1, -1, self.detector.height, self.detector.width)
+            warped_projs.append(warped_proj)
+        return torch.cat(warped_projs, dim=0)
+
+    def forward(self, input):
+        moving, target_proj, target_volume, moving_cp, density, target_poses, affine_inverse = self.load_input_params(input)
+        B, _, W, H, D = moving.shape
+        coefs, disp_field = self._estimate_flow(moving, target_volume)
+        self._log_memory("model/after_estimate_flow")
+
+        if self.use_polyrigid:
+            seg_weights = input['weights'].to(density.device)
+            affine_mat = input['affine'].to(density.device)
+            disp_field = self._polyrigid_to_displacement(
+                coefs, seg_weights, affine_mat, (W, H, D))
+            self._log_memory("model/after_polyrigid_disp")
+
+        disp_norm = disp_field.clone()
+        disp_norm[:, 0] = disp_norm[:, 0] * (2.0 / (W - 1))
+        disp_norm[:, 1] = disp_norm[:, 1] * (2.0 / (H - 1))
+        disp_norm[:, 2] = disp_norm[:, 2] * (2.0 / (D - 1))
+        deform_field = disp_norm + self.id_transform
+        self._log_memory("model/after_deform_field")
+
+        warped_moving = self.bilinear(density, deform_field)
+        warped_proj = self.warp_render(warped_moving, target_poses, affine_inverse)
+        self._log_memory("model/after_warp_render")
+
+        model_output = {
+            "params": disp_field,
+            "pca_coefs": coefs,
+            "target_proj": target_proj,
+            "warped_proj": warped_proj,
+        }
+        if 'warped_density_gt' in input:
+            model_output['warped_density_gt'] = input['warped_density_gt']
+        if 'displacement_gt' in input:
+            model_output['displacement_gt'] = input['displacement_gt']
+        return model_output
+        
+
+class model_tips3d(model):
+    def __init__(self, img_sz, opt=None):
+        super(model_tips3d, self).__init__(img_sz, opt)
+        self.reorient = torch.tensor(
+            [
+                [1, 0, 0, 0],
+                [0, 1, 0, 0],
+                [0, 0, 1, 0],
+                [0, 0, 0, 1],
+            ],
+            dtype=torch.float32,
+        )
+    
+    def load_input_params(self, input):
+        self.sdd = input["sdd"]
+        self.infer_detector_width = input["infer_detector_width"]
+        self.proj_spacing = input["proj_spacing"]
+        self.foreground_mask = input["foreground_mask"]
+        moving = input['source']
+        target_proj = input["target_proj"]
+        target_volume = input["target_volume"]
+        if 'source_label' in input:
+            moving_seg = input['source_label']
+            moving_cp = (moving + 1) * moving_seg - 1
+        else:
+            moving_cp = moving
+        density = input['density']
+        target_poses = input['target_poses'].to(
+            device=density.device, dtype=torch.float32)
+        affine_inverse = input['affine'].to(
+            device=density.device, dtype=torch.float32).inverse()
+
+        return moving, target_proj, target_volume, moving_cp, density, target_poses, affine_inverse
+
+    def warp_render(self, warped_moving, target_poses, affine_inverse):
+        B, _, _, _, _ = warped_moving.shape
+        device = warped_moving.device
+        warped_projs = []
+        for b in range(B):
+            width = self._batch_scalar(self.infer_detector_width, b)
+            delx = self._batch_scalar(self.proj_spacing, b, flat_index=0)
+            dely = self._batch_scalar(self.proj_spacing, b, flat_index=1)
+            self.detector = self._build_detector(
+                self.sdd[b], width, delx, dely, device)
+            warped_proj = self.renderer(
+                warped_moving[b, 0],
+                target_poses[b],
+                affine_inverse[b],
+            ).view(1, -1, self.detector.height, self.detector.width)
+            warped_proj = self._preprocess_proj(warped_proj, self.foreground_mask[b])
+            warped_projs.append(warped_proj)
+        return torch.cat(warped_projs, dim=0).flip(dims=[2])

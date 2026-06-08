@@ -1,7 +1,6 @@
 from __future__ import division, print_function
 
 import os
-
 import numpy as np
 import progressbar as pb
 import SimpleITK as sitk
@@ -17,6 +16,7 @@ from diffdrr.renderers import Siddon
 from diffdrr.pose import RigidTransform, convert
 from ..utils.sdct_projection_utils import backproj_grids_with_SOUV
 from polypose.weights import compute_weights
+from scipy.spatial.transform import Rotation
 
 class Warp(torch.nn.Module):
     """Base class for all 3D deformation fields."""
@@ -92,7 +92,19 @@ class Warp(torch.nn.Module):
             mask = mask.to(pts.dtype)
         return F.grid_sample(mask, pts, align_corners=False, mode="nearest").squeeze().to(dtype)
 
-class FluoroDataset(Dataset):
+def parse_mhd_header(mhd_path):
+    """读取 mhd 文本头，解析 key=value 字段。"""
+    meta = {}
+    with mhd_path.open("r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            meta[key.strip()] = value.strip()
+    return meta
+
+class TipsDataset3D(Dataset):
     """
     2D DRR + 3D CT registration dataset.
 
@@ -105,8 +117,7 @@ class FluoroDataset(Dataset):
 
     def __init__(self, data_path, phase=None, transform=None, option=None):
         self.data_path = data_path
-        self.org_data_path = "/home/zzx/data/deepfluoro"
-        self.drr_path  = os.path.join(self.data_path, "drr")
+        self.org_data_path = "/home/zzx/data/tips_dataset3d"
         self.cache_dir = os.path.join(self.data_path, "preprocessed")
         self.warp_path = os.path.join(self.data_path, "warp_pose")
         self.warped_data_path = os.path.join(self.data_path, "warped_data")
@@ -124,9 +135,9 @@ class FluoroDataset(Dataset):
 
         self.has_label = option[('use_segmentation_map', False,
                                  'load segmentation maps')]
-        self.supervise = option[('supervise', False,
-                                 'use warped density GT for supervision')]
         self.spacing   = option[('spacing_to_refer', (1, 1, 1), '')]
+        self.img_after_resize = option[('img_after_resize', (160, 160, 160), '')]
+        self.img_after_resize_2d = option[('img_after_resize_2d', (512, 512), '')]
         self.load_projection_interval = option[('load_projection_interval', 1, '')]
         self.apply_hu_clip = option[('apply_hu_clip', False, '')]
 
@@ -150,12 +161,12 @@ class FluoroDataset(Dataset):
         self.aug_scale_range     = option[('aug_scale_range',     (0.95, 1.05), '')]
         # self.aug_proj_mask_prob  = option[('aug_proj_mask_prob',  0.3, '')]
         self.detector_spacing = option[('detector_spacing', 0.7255, '')]
-        self.detector_width = option[('detector_width', 384, '')]
+        self.detector_width = option[('detector_width', 512, '')]
 
         self.reorient = torch.tensor(
             [[1, 0, 0, 0],
-             [0, 0, 1, 0],
              [0, 1, 0, 0],
+             [0, 0, 1, 0],
              [0, 0, 0, 1]], dtype=torch.float32)
 
         # meta_list holds lightweight per-sample dicts (poses, affine)
@@ -167,8 +178,10 @@ class FluoroDataset(Dataset):
     # Identifier list
     # ------------------------------------------------------------------
     def get_identifier_list(self):
+        ct_root = Path(self.org_data_path)
+        matches = sorted(ct_root.rglob("*DSA.mhd"))
         self.identifier_list = [
-            i[:-7] for i in os.listdir(self.drr_path) if i.endswith('.nii.gz')
+            i.stem for i in matches
         ]
         if self.max_num_for_loading > 0:
             self.identifier_list = self.identifier_list[:self.max_num_for_loading]
@@ -182,7 +195,7 @@ class FluoroDataset(Dataset):
         if not hasattr(self, '_detector') or self._detector is None:
             self._detector = Detector(
                 # 1020.0, 718, 718, 0.388, 0.388, 0, 0,
-                1020.0, self.detector_width, self.detector_width, self.detector_spacing, self.detector_spacing, 0, 0,
+                self.sdd, self.detector_width, self.detector_width, self.detector_spacing, self.detector_spacing, 0, 0,
                 self.reorient, reverse_x_axis=True, n_subsample=None,
             )
 
@@ -193,21 +206,82 @@ class FluoroDataset(Dataset):
         img_input = (tgt - src).norm(dim=-1).unsqueeze(1)
         src = RigidTransform(affine_inverse)(src)
         tgt = RigidTransform(affine_inverse)(tgt)
-        return self._siddon(density, src, tgt, img_input).view(
+        return self._siddon(density, src, tgt, img_input, align_corners=False).view(
             1, -1, self._detector.height, self._detector.width)
 
-    def _load_dataset(self, subject_id, dataset="deepfluoro"):
+    def _preprocess_xray(self, xray_path, crop, linearize):
+        img = sitk.GetArrayFromImage(sitk.ReadImage(xray_path))
+        mask = img > 0
+        from scipy.ndimage import binary_erosion
+        k = 5  # 想收几像素就设几
+        mask = binary_erosion(mask, iterations=k)
+        """Configurable X-ray preprocessing"""
+        # Remove edge artifacts caused by the collimator
+        def center_crop_np(img, out_hw):
+            out_h, out_w = out_hw
+            *lead, h, w = img.shape
+            top = max((h - out_h) // 2, 0)
+            left = max((w - out_w) // 2, 0)
+            return img[..., top:top + out_h, left:left + out_w]
+        def robust_normalization(img, lower_percentile=1, upper_percentile=99):
+            # 1. 计算百分位数，剔除上下各 1% 的极端值
+            p_min, p_max = np.percentile(img, (lower_percentile, upper_percentile))
+            
+            # 2. 进行截断处理（Clipping）
+            img_clipped = np.clip(img, p_min, p_max)
+            
+            # 3. 重新归一化到 [0, 1]
+            img_norm = (img_clipped - p_min) / (p_max - p_min + 1e-7)
+            
+            return img_norm
+        if crop != 0:
+            *_, height, width = img.shape
+            img = center_crop_np(img, (height - crop, width - crop))
+
+        # 
+        if linearize:
+            # img += 1
+            if mask is not None:
+                # 仅对掩码区域变换
+                img_log = np.zeros_like(img, dtype=np.float32)
+                img_log[mask] = np.log(img[mask].max()) - np.log(img[mask])
+                img = img_log
+            else:
+                img += 1
+                img = np.log(img.max()) - np.log(img)
+        else:
+            img_mask = np.zeros_like(img, dtype=np.float32)
+            img_mask[mask] = img[mask]
+            img = img_mask
+        # Rescale to [0, 1]
+        img = robust_normalization(img)
+        return img, mask
+
+    def _load_dataset(self, identifier):
         # datapath = Path(rf"/home/zzx/data/deepfluoro/subject{subject_id:02d}")
-        datapath = Path(os.path.join(self.org_data_path, subject_id))
-
+        datapath = Path(self.org_data_path) / identifier.split('-')[0]
         # Make paths to the relevant images
-        volume = datapath / "volume.nii.gz"
-        mask = datapath / "mask.nii.gz"
-        xrays = datapath / "xrays"
-        segs = datapath / "segmentations"
-
+        volume = datapath / f"{identifier.split('-')[-2]}_volume.nii.gz"
+        mask = datapath / "liver.nii.gz"
+        xrays = datapath / f"{identifier}.mhd"
+        rigid_case_name = identifier.split('-')[0] + "_DSA_" + identifier.split('-')[1] + "-CT_" + identifier.split('-')[0] \
+            + "_CT_" + identifier.split('-')[-2]
+        meta = parse_mhd_header(xrays)
+        if os.path.exists(datapath / f"{rigid_case_name}_meta.pt"):
+            param_dict = torch.load(datapath / f"{rigid_case_name}_meta.pt")
+        else:
+            param_dict = torch.load(datapath / f"{identifier.split('-')[0]}_meta.pt")
+            volume = datapath / "data_volume.nii.gz"
+        rigid_param = param_dict["rigid_param"]
+        extrinsic_cam2world = torch.as_tensor(param_dict["extrinsic_cam2world"], dtype=torch.float32)
+        target_proj, foreground_mask = self._preprocess_xray(xrays, crop=0, linearize=True)
+        if target_proj.ndim == 2:
+            target_proj = target_proj[None, ...] 
+            foreground_mask = foreground_mask[None, ...] 
+        # target_proj = np.transpose(target_proj, (0, 2, 1))  # 把 proj变成hw顺序            
+        target_proj_np = target_proj.astype(np.float32)
         # return ScalarImage(volume), LabelMap(mask), xrays, LabelMap(segs)
-        return volume, mask, xrays, segs
+        return volume, mask, target_proj_np, foreground_mask, rigid_param, extrinsic_cam2world, meta
 
     def _cache_is_valid(self, npz_path, meta_path):
         if not (os.path.exists(npz_path) and os.path.exists(meta_path)):
@@ -216,21 +290,18 @@ class FluoroDataset(Dataset):
         try:
             with np.load(npz_path) as npz:
                 required_keys = {
-                    'cache_version', 'source', 'density', 'target_proj', 'target_volume', 'spacing'
+                    'cache_version', 'source', 'density', 'target_proj', 'target_volume', 'spacing', 'proj_spacing',
+                    'infer_detector_width', 'sdd',
+                    'foreground_mask'
                 }
                 if self.has_label:
                     required_keys.update({'source_seg', 'weights'})
-                if self.supervise:
-                    required_keys.add('warped_density_gt')
                 if self.offline_aug_variants > 0:
                     required_keys.update({
-                        'aug_source', 'aug_density', 'aug_target_proj',
-                        'aug_target_volume', 'aug_affines'
+                        'aug_source', 'aug_density', 'aug_affines'
                     })
                     if self.has_label:
                         required_keys.update({'aug_source_seg', 'aug_weights'})
-                    if self.supervise:
-                        required_keys.update({'aug_warped_density_gt', 'aug_displacement_gt'})
 
                 if not required_keys.issubset(set(npz.files)):
                     return False
@@ -248,62 +319,29 @@ class FluoroDataset(Dataset):
         return True
 
     def _build_offline_augmented_bank_3d(
-        self, identifier, source, density, source_seg, weights, affine, target_poses, target_poses_SOUV
+        self, identifier, source, density, source_seg, weights, affine, foreground_mask
     ):
         if self.offline_aug_variants <= 0 or source_seg is None or weights is None:
             return None
-
-        rot_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_rot_")}.pt')
-        xyz_path = os.path.join(self.warp_path, f'{identifier.replace("drr", "poses_xyz_")}.pt')
-        poses_rot = torch.load(rot_path, map_location="cpu", weights_only=True)
-        poses_xyz = torch.load(xyz_path, map_location="cpu", weights_only=True)
 
         aug_source = []
         aug_density = []
         aug_source_seg = []
         aug_weights = []
-        aug_target_proj = []
-        aug_target_volume = []
+        aug_foreground_mask = []
         aug_affines = []
-        aug_warped_density_gt = [] if self.supervise else None
-        aug_displacement_gt = [] if self.supervise else None
 
         for _ in range(self.offline_aug_variants):
             (source_aug, density_aug, source_seg_aug, weights_aug,
              affine_aug, affine_grid) = self._apply_shared_affine_3d(
                 source, density, source_seg, weights, affine.clone(), force=True)
 
-            warp = Warp(density_aug, source_seg_aug, weights_aug, poses_rot, poses_xyz, affine_aug)
-            warped_density, _, displacement = warp()
-
-            target_proj_aug = self._run_renderer(
-                warped_density, target_poses, affine_aug.inverse())[0].detach().cpu().numpy()
-            proj_for_bp = torch.from_numpy(target_proj_aug).flip(dims=[1, 2])
-            target_volume_aug = self.backproject_volume(
-                target_poses_SOUV, proj_for_bp, source_aug.shape,
-                device=torch.device('cpu')).cpu().numpy()
-            target_volume_aug = np.transpose(target_volume_aug, (2, 1, 0))
-            target_volume_aug = self._apply_affine_grid(
-                target_volume_aug, affine_grid, mode='bilinear', padding_mode='border')
-
             aug_source.append(np.ascontiguousarray(source_aug.astype(np.float32)))
             aug_density.append(np.ascontiguousarray(density_aug.astype(np.float32)))
             aug_source_seg.append(np.ascontiguousarray(source_seg_aug.astype(np.float32)))
             aug_weights.append(np.ascontiguousarray(weights_aug.astype(np.float32)))
-            aug_target_proj.append(np.ascontiguousarray(target_proj_aug.astype(np.float32)))
-            aug_target_volume.append(np.ascontiguousarray(target_volume_aug.astype(np.float32)))
             aug_affines.append(affine_aug.numpy().astype(np.float32))
-            if self.supervise:
-                aug_warped_density_gt.append(
-                    np.ascontiguousarray(warped_density.detach().cpu().numpy().astype(np.float32))
-                )
-                aug_displacement_gt.append(
-                    np.transpose(
-                        displacement.detach().cpu().numpy().astype(np.float32),
-                        (3, 0, 1, 2)
-                    )
-                )
-
+            aug_foreground_mask.append(np.ascontiguousarray(foreground_mask.astype(np.float32)))
         if len(aug_source) == 0:
             return None
 
@@ -312,13 +350,10 @@ class FluoroDataset(Dataset):
             'aug_density': np.stack(aug_density, axis=0).astype(np.float32),
             'aug_source_seg': np.stack(aug_source_seg, axis=0).astype(np.float32),
             'aug_weights': np.stack(aug_weights, axis=0).astype(np.float32),
-            'aug_target_proj': np.stack(aug_target_proj, axis=0).astype(np.float32),
-            'aug_target_volume': np.stack(aug_target_volume, axis=0).astype(np.float32),
             'aug_affines': np.stack(aug_affines, axis=0).astype(np.float32),
+            'aug_foreground_mask': np.stack(aug_foreground_mask, axis=0).astype(np.float32),
         }
-        if self.supervise:
-            save_dict['aug_warped_density_gt'] = np.stack(aug_warped_density_gt, axis=0).astype(np.float32)
-            save_dict['aug_displacement_gt'] = np.stack(aug_displacement_gt, axis=0).astype(np.float32)
+
         return save_dict
     # ------------------------------------------------------------------
     # Stage 1 – Preprocessing & caching  (runs once per identifier)
@@ -329,26 +364,30 @@ class FluoroDataset(Dataset):
         meta_path = os.path.join(self.cache_dir, f'{identifier}_meta.pt')
         if self._cache_is_valid(npz_path, meta_path):
             return  # already cached
-
-        self._init_projector_if_needed()
+   
         # ---- 1. Load & preprocess CT volume ----
         # source_img, source_seg, xrays, _ = self._load_dataset(identifier.split('_')[0])
-        volume, mask, xrays, segs = self._load_dataset(identifier.split('_')[0])
+        volume, mask, target_proj_np, foreground_mask, rigid_param, extrinsic_cam2world, meta = self._load_dataset(identifier)
+        self.sdd = float(meta.get("Extra_SourceToDetectorDistance", 1020.0))
+        spacing_vals = [float(x) for x in meta.get("ElementSpacing", "0.7255 0.7255").split()]
+        self.detector_width = int(meta.get("DimSize", "512 512").split()[0])
+        self.detector_spacing = spacing_vals[0]
+        self._init_projector_if_needed()     
         # source_img = ScalarImage(
         #     os.path.join(self.data_path,
         #                  identifier.split('_')[0] + '_source.nii.gz'))
         source_img = ScalarImage(volume) # X, Y, Z
         # source_seg = ScalarImage(mask)
         source_seg = LabelMap(mask)
-        source_img = self.canonicalize(source_img)
-        source_seg = self.canonicalize(source_seg, is_label=True)
+        source_img = self.canonicalize(source_img, rigid_param)
+        source_seg = self.canonicalize(source_seg, rigid_param, is_label=True)
         # subject = self.canonicalize(subject)
         subject = Subject(volume=source_img, mask=source_seg)
-        _, weights = compute_weights(subject, labels=[[1, 2, 3, 4, 7], [5], [6]])
-
+        _, weights = compute_weights(subject, labels=[[1]])
+        new_spacing = [source_img.shape[i+1] * source_img.spacing[i] / self.img_after_resize[i] for i in range(3)]
         tfm = torchio.transforms.Compose([
-            torchio.transforms.Resample((2.2, 2.2, 2.2)),
-            torchio.transforms.CropOrPad((160, 160, 160), padding_mode=-2048),
+            torchio.transforms.Resample(new_spacing),
+            # torchio.transforms.CropOrPad(self.img_after_resize, padding_mode=-2048),
         ])
         source_img = tfm(source_img)
         if self.has_label and source_seg is not None:
@@ -367,57 +406,43 @@ class FluoroDataset(Dataset):
 
         affine = torch.as_tensor(source_img.affine, dtype=torch.float32)
 
-        # ---- 2. Load pose & render DRR ----
-        target_poses, *_ = torch.load(
-            os.path.join(self.drr_path,
-                         identifier.split('_')[0] + '_pose.pt'),
-            weights_only=False)['pose'][::self.load_projection_interval]
-        # render要求的输入图像是xyz顺序
-        target_proj_t = sitk.GetArrayFromImage(sitk.ReadImage(os.path.join(self.drr_path,
-                         identifier + '.nii.gz')))
-        target_proj_t = np.transpose(target_proj_t, (0, 2, 1))  # 把 proj变成hw顺序            
-        target_proj_np = target_proj_t.astype(np.float32)
-
+        # debug
+        data_path = "/home/zzx/code"
+        sour_proj = self._run_renderer(density_t[0], extrinsic_cam2world, affine.inverse())
+        img = sitk.GetImageFromArray(sour_proj[0].flip(dims=[1]))
+        img.SetSpacing((self.detector_spacing, self.detector_spacing, 1))
+        sitk.WriteImage(img, os.path.join(data_path, "sour_proj.nii.gz"))
         # ---- 3. Back-project 2D → 3D volume ----
         target_poses_SOUV = self._extrinsic_cam2world_to_SOUV(
-            target_poses, self.reorient[:3, :3], sdd=1020.0)
+            extrinsic_cam2world, self.reorient[:3, :3], \
+                sdd=self.sdd)
         # proj_for_bp = (torch.from_numpy(target_proj_np)
         #                .permute(0, 2, 1).flip(dims=[2]))
-        proj_for_bp = torch.from_numpy(target_proj_np).flip(dims=[1, 2])
+        proj_for_bp = torch.from_numpy(target_proj_np)
         target_volume = self.backproject_volume(
             target_poses_SOUV, proj_for_bp, source_arr.shape,
-            device=torch.device('cpu')).permute(2, 1, 0) # (X, Y, Z)
+            new_spacing, device=torch.device('cpu')).permute(2, 1, 0) # (X, Y, Z)
         target_volume_np = target_volume.detach().cpu().numpy().astype(np.float32) # (X, Y, Z)
-
-        # ---- 3b. Load warped density GT (if available) ----
-        warped_gt_name = identifier.replace("drr", "density_") + ".nii.gz"
-        warped_gt_file = os.path.join(self.warped_data_path, warped_gt_name)
-
+        target_proj_np = self._resize_projection_stack(target_proj_np[0], mode="bilinear")
+        foreground_mask = self._resize_projection_stack(foreground_mask[0], mode="nearest")
+        proj_spacing = [self.detector_spacing * self.detector_width / self.img_after_resize_2d[i] for i in range(2)]
         # ---- 4. Save to disk ----
         save_dict = dict(
             cache_version=np.array([self.cache_version], dtype=np.int16),
-            source=source_arr,
-            density=density_arr,
+            source=source_arr, # (X, Y, Z)
+            density=density_arr, # (X, Y, Z)
             target_proj=target_proj_np, # (P, H, W)
-            target_volume=target_volume_np,
-            spacing=np.array(self.spacing, dtype=np.float32),
+            target_volume=target_volume_np,# (X, Y, Z)
+            foreground_mask=foreground_mask, # (1, H, W)
+            spacing=np.array(new_spacing, dtype=np.float32),
+            proj_spacing=np.array(proj_spacing, dtype=np.float32),
+            infer_detector_width=self.img_after_resize_2d[0],
+            sdd=self.sdd,
         )
         if self.has_label and source_seg is not None:
             save_dict['source_seg'] = (
                 source_seg.data.squeeze(0).numpy().astype(np.float32))
             save_dict['weights'] = weights.detach().cpu().numpy().astype(np.float32)
-        if os.path.exists(warped_gt_file):
-            warped_gt_img = ScalarImage(warped_gt_file)
-            warped_gt_img = self.canonicalize(warped_gt_img)
-            tfm_wgt = torchio.transforms.Compose([
-                torchio.transforms.Resample((2.2, 2.2, 2.2)),
-                torchio.transforms.CropOrPad((160, 160, 160), padding_mode=0),
-            ])
-            warped_gt_img = tfm_wgt(warped_gt_img)
-            save_dict['warped_density_gt'] = (
-                warped_gt_img.data.squeeze(0).numpy().astype(np.float32))
-        elif self.supervise:
-            save_dict['warped_density_gt'] = np.zeros_like(source_arr, dtype=np.float32)
 
         aug_dict = self._build_offline_augmented_bank_3d(
             identifier,
@@ -426,8 +451,7 @@ class FluoroDataset(Dataset):
             save_dict.get('source_seg', None),
             save_dict.get('weights', None),
             affine,
-            target_poses,
-            target_poses_SOUV,
+            foreground_mask,
         )
         if aug_dict is not None:
             save_dict.update(aug_dict)
@@ -435,7 +459,7 @@ class FluoroDataset(Dataset):
 
         torch.save(dict(
             affine=affine,
-            target_poses=target_poses,
+            target_poses=extrinsic_cam2world,
             target_poses_SOUV=target_poses_SOUV,
         ), meta_path)
 
@@ -689,7 +713,7 @@ class FluoroDataset(Dataset):
         grid = F.affine_grid(
             theta,
             size=(1, 1, int(vol_shape[0]), int(vol_shape[1]), int(vol_shape[2])),
-            align_corners=True,
+            align_corners=False,
         )
         return grid, voxel_to_input
 
@@ -705,7 +729,7 @@ class FluoroDataset(Dataset):
             grid,
             mode=mode,
             padding_mode=padding_mode,
-            align_corners=True,
+            align_corners=False,
         )
         sampled = sampled.squeeze(0).cpu().numpy().astype(np.float32)
         return sampled[0] if arr.ndim == 3 else sampled
@@ -763,6 +787,18 @@ class FluoroDataset(Dataset):
 
         return source, density, source_seg, weights, target_proj, target_volume, new_affine
 
+    def _resize_projection_stack(self, proj, mode):
+        tensor = torch.from_numpy(np.ascontiguousarray(proj.astype(np.float32))).unsqueeze(0).unsqueeze(0)
+        kwargs = {"align_corners": False} if mode == "bilinear" else {}
+        # kwargs = {"align_corners": True} if mode == "bilinear" else {}
+        resized = F.interpolate(
+            tensor,
+            size=self.img_after_resize_2d,
+            mode=mode,
+            **kwargs,
+        )
+        return resized.squeeze(0).numpy().astype(np.float32)
+
     # ------------------------------------------------------------------
     # Stage 2 + 3 – __getitem__
     # ------------------------------------------------------------------
@@ -779,45 +815,32 @@ class FluoroDataset(Dataset):
             target_proj   = np.ascontiguousarray(npz['target_proj'].astype(np.float32))    # (P, H, W)
             target_volume = np.ascontiguousarray(npz['target_volume'].astype(np.float32))  # (D, H, W)
             spacing       = np.ascontiguousarray(npz['spacing'].astype(np.float32))
+            proj_spacing  = np.ascontiguousarray(npz['proj_spacing'].astype(np.float32))
+            sdd = np.float32(npz['sdd'])
+            infer_detector_width = np.ascontiguousarray(npz['infer_detector_width'].astype(np.float32))
             source_seg    = (np.ascontiguousarray(npz['source_seg'].astype(np.float32))
                              if self.has_label else None)
             weights       = (np.ascontiguousarray(npz['weights'].astype(np.float32))
                              if self.has_label else None)
-
-            # ---- Load warped density GT from cache (for 3D volume similarity loss) ----
-            if self.supervise:
-                has_warped_gt = 'warped_density_gt' in npz
-                warped_density_gt = (
-                    np.ascontiguousarray(npz['warped_density_gt'].astype(np.float32))
-                    if has_warped_gt else np.zeros_like(source))
-                displacement_gt = np.zeros((3, *source.shape), dtype=np.float32)
+            foreground_mask = np.ascontiguousarray(npz['foreground_mask'].astype(np.float32))
 
             if self.enable_aug and self.offline_aug_variants > 0 and 'aug_source' in npz:
                 if np.random.rand() < self.aug_affine_prob:
                     aug_idx = np.random.randint(npz['aug_source'].shape[0])
                     source = np.ascontiguousarray(npz['aug_source'][aug_idx].astype(np.float32))
                     density = np.ascontiguousarray(npz['aug_density'][aug_idx].astype(np.float32))
-                    target_proj = np.ascontiguousarray(npz['aug_target_proj'][aug_idx].astype(np.float32))
-                    target_volume = np.ascontiguousarray(npz['aug_target_volume'][aug_idx].astype(np.float32))
                     affine = torch.from_numpy(npz['aug_affines'][aug_idx].astype(np.float32))
                     if self.has_label and 'aug_source_seg' in npz:
                         source_seg = np.ascontiguousarray(npz['aug_source_seg'][aug_idx].astype(np.float32))
                     if self.has_label and 'aug_weights' in npz:
                         weights = np.ascontiguousarray(npz['aug_weights'][aug_idx].astype(np.float32))
-                    if self.supervise and 'aug_warped_density_gt' in npz:
-                        warped_density_gt = np.ascontiguousarray(
-                            npz['aug_warped_density_gt'][aug_idx].astype(np.float32))
-                    if self.supervise and 'aug_displacement_gt' in npz:
-                        displacement_gt = np.ascontiguousarray(
-                            npz['aug_displacement_gt'][aug_idx].astype(np.float32))
         # ---- Online augmentation (train phase only) ----
         if self.enable_aug:
             source_aug = source
             target_volume_aug = target_volume
-            target_proj_aug = target_proj
             source_aug = self._augment_3d_intensity(source_aug)
             density = self._augment_3d_intensity(density)
-            target_proj_aug, aug_tag = self._augment_2d_projs_shared(target_proj_aug)
+            target_proj_aug, aug_tag = self._augment_2d_projs_shared(target_proj)
         else:
             source_aug = source
             target_volume_aug = target_volume
@@ -838,10 +861,14 @@ class FluoroDataset(Dataset):
             'density':           np.expand_dims(density,       0),  # (1,D,H,W)
             'target_volume':     np.expand_dims(target_volume_aug, 0),  # (1,D,H,W)
             'target_proj':       target_proj_aug,                        # (P,H,W)
+            'foreground_mask':   foreground_mask,     # (1,H,W)
             'spacing':           spacing,
             'affine':            affine,
             'target_poses':      meta['target_poses'],
             'target_poses_SOUV': meta['target_poses_SOUV'],
+            'sdd': sdd,
+            'infer_detector_width': infer_detector_width,
+            'proj_spacing':      proj_spacing,
         }
         if self.has_label and source_seg is not None:
             sample['source_label'] = np.expand_dims(source_seg, 0)  # (1,D,H,W)
@@ -851,11 +878,6 @@ class FluoroDataset(Dataset):
                 weights_t, size=source.shape, mode='trilinear', align_corners=False
             ).squeeze(0).numpy().astype(np.float32)
             sample['weights'] = weights_interp  # (K,D,H,W)
-        if self.supervise:
-            warped_density_gt = np.ascontiguousarray(warped_density_gt.astype(np.float32))
-            displacement_gt = np.ascontiguousarray(displacement_gt.astype(np.float32))
-            sample['warped_density_gt'] = np.expand_dims(warped_density_gt, 0)
-            sample['displacement_gt'] = displacement_gt
 
         if self.transform:
             sample['source'] = self.transform(sample['source'])
@@ -882,11 +904,11 @@ class FluoroDataset(Dataset):
         return density
 
     def backproject_volume(self, target_poses_SOUV, target_proj,
-                           source_arr_shape, device=torch.device('cpu')):
+                           source_arr_shape, spacing, device=torch.device('cpu')):
         S, O, U, V = [x.to(device=device, dtype=torch.float32)
                       for x in target_poses_SOUV]
         grids = backproj_grids_with_SOUV(
-            source_arr_shape,
+            source_arr_shape, spacing,
             S.unsqueeze(0), O.unsqueeze(0), U.unsqueeze(0), V.unsqueeze(0),
             target_proj.shape[2], target_proj.shape[1],
             # du=0.388, dv=0.388,
@@ -899,14 +921,23 @@ class FluoroDataset(Dataset):
             1, source_arr_shape[0] * source_arr_shape[1], source_arr_shape[2], 2)
         flat = F.grid_sample(
             target_proj.reshape(1, 1, target_proj.shape[1], target_proj.shape[2]),
-            grid, align_corners=True, padding_mode='zeros')
+            # grid, align_corners=True, padding_mode='zeros')
+            grid, align_corners=False, padding_mode='zeros')
         invalid = ((grid[..., 0] < -1) | (grid[..., 0] > 1) |
                    (grid[..., 1] < -1) | (grid[..., 1] > 1))
-        flat = flat.masked_fill(invalid.unsqueeze(1), -1.0)
+        # flat = flat.masked_fill(invalid.unsqueeze(1), -1.0)
+        flat = flat.masked_fill(invalid.unsqueeze(1), 0)
         vol  = flat.reshape(*source_arr_shape)
-        return self._normalize_intensity(vol)
+        return self._normalize_intensity_bp(vol)
 
-    def canonicalize(self, volume, is_label=False):
+    def rigid_from_6params(self, rx_deg, ry_deg, rz_deg, tx, ty, tz):
+        Rm = Rotation.from_euler("xyz", [rx_deg, ry_deg, rz_deg], degrees=True).as_matrix()
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = Rm
+        T[:3, 3] = np.array([tx, ty, tz], dtype=np.float64)
+        return T
+
+    def canonicalize(self, volume, rigid_param, is_label=False):
         """Move the Subject's isocenter to the origin in world coordinates"""
         isocenter = volume.get_center()
         Tinv = np.array([
@@ -914,11 +945,16 @@ class FluoroDataset(Dataset):
             [0, 1, 0, -isocenter[1]],
             [0, 0, 1, -isocenter[2]],
             [0, 0, 0,  1           ]], dtype=np.float64)
-        # return ScalarImage(tensor=volume.data, affine=)
+        T_user_lps = self.rigid_from_6params(*rigid_param)
+        # T_user = np.linalg.inv(T_user)
+        # LPS → RAS 转换: 翻转 x, y 轴
+        S = np.diag([-1.0, -1.0, 1.0, 1.0])
+        T_user_ras = S @ T_user_lps @ S
+        affine_new = T_user_ras @ Tinv @ volume.affine
         if is_label:
-            return LabelMap(tensor=volume.data, affine=Tinv.dot(volume.affine))
+            return LabelMap(tensor=volume.data, affine=affine_new)
         else:
-            return ScalarImage(tensor=volume.data, affine=Tinv.dot(volume.affine))
+            return ScalarImage(tensor=volume.data, affine=affine_new)
 
     def _extrinsic_cam2world_to_SOUV(self, extrinsic, reorient, sdd, device=None):
         R = extrinsic[:3, :3]
@@ -960,6 +996,29 @@ class FluoroDataset(Dataset):
             normalized = (img - mn) / (mx - mn)
         return normalized * 2 - 1
 
+    def _normalize_intensity_bp(self, img, linear_clip=False, clip_range=None):
+        """Normalize image intensities to [-1, 1]. Handles numpy and torch."""
+        if linear_clip:
+            if clip_range is not None:
+                if isinstance(img, np.ndarray):
+                    img = img.copy()
+                    img[img < clip_range[0]] = clip_range[0]
+                    img[img > clip_range[1]] = clip_range[1]
+                else:
+                    img = img.clone()
+                    img[img < clip_range[0]] = clip_range[0]
+                    img[img > clip_range[1]] = clip_range[1]
+                normalized = (img - clip_range[0]) / (clip_range[1] - clip_range[0])
+            else:
+                img = img - img.min()
+                arr_np = img.numpy() if torch.is_tensor(img) else img
+                normalized = img / float(np.percentile(arr_np, 95)) * 0.95
+        else:
+            mn = img.min()
+            mx = img.max()
+            normalized = (img - mn) / (mx - mn)
+        return torch.where(normalized > 0, normalized + 0.2 - 1, normalized - 1)
+
     def _resample_image(self, image, new_size, new_spacing, is_label=False):
         resampler = sitk.ResampleImageFilter()
         resampler.SetSize(new_size)
@@ -989,10 +1048,3 @@ class FluoroDataset(Dataset):
         idx_list  = list(range(len(dict_to_split)))
         idx_split = np.array_split(np.array(idx_list), split_num)
         return [dict_to_split[s[0]:s[-1] + 1] for s in idx_split]
-
-
-class ToTensor(object):
-    """Convert ndarrays in sample to Tensors."""
-
-    def __call__(self, sample):
-        return torch.from_numpy(sample)

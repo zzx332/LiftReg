@@ -1,8 +1,8 @@
 {
     "dataset": {
         "apply_hu_clip": true,
-        "data_path": "/home/zzx/data/tips_drr/train",
-        "val_data_path": "/home/zzx/data/tips_drr/val",
+        "data_path": "/home/zzx/data/tips_drr_newdataset",
+        "val_data_path": "/home/zzx/data/tips_drr_newdataset",
         "dataset_class": "liftreg.dataset.TipsDataset2D.TipsDataset2D",
         "drr_folder_name": "diffdrr",
         "img_after_resize": [160, 160],
@@ -16,7 +16,7 @@
         "label_groups": null,
         "weightfn": "gravity",
         "augmentation_enable": true,
-        "offline_aug_variants": 20,
+        "offline_aug_variants": 10,
         "aug_noise_prob": 0.5,
         "aug_affine_prob": 0.3,
         "aug_rotate_deg": 2.0,
@@ -41,7 +41,7 @@
             "sim_factor": 1.0,
             "reg_factor": 5.0,
             "use_dice": false,
-            "sim_class": "liftreg.layers.losses.NCC2D"
+            "sim_class": "liftreg.layers.losses.PatternIntensity"
         },
         "loss_class": "liftreg.losses.RegLoss2D.loss",
         "mode": "train",
@@ -59,13 +59,14 @@
                 },
                 "type": "custom"
             },
-            "optim_type": "adam"
+            "optim_type": "adam",
+            "polyrigid_head_lr_mult": 10.0
         },
         "output_path": "/home/zzx/data/exp_liftreg_2d",
         "save_model_frequency": 50,
-        "val_frequency": 20,
+        "val_frequency": 50,
         "num_refine_steps": 1,
-        "use_polyrigid": false,
+        "use_polyrigid": true,
         "num_segments": 3,
         "use_velocity": false,
         "int_steps": 0

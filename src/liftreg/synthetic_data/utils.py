@@ -22,7 +22,7 @@ KWARGS = dict(
     # renderer="trilinear",
     renderer="siddon",
     drr_kwargs={
-        "voxel_shift": 0.0,
+        "voxel_shift": 0.5,
         "patch_size": 256
     },
     read_kwargs={"bone_attenuation_multiplier": 2.0},
